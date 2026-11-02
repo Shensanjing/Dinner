@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="今晚吃什么">
+<meta name="theme-color" content="#fdf7f1">
+<title>今晚吃什么 · 家庭晚餐计划</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div class="top-row">
+      <h1 id="title">今晚吃什么</h1>
+      <button class="icon-btn" id="btnPrev" title="上一周">‹</button>
+      <button class="icon-btn" id="btnNext" title="下一周">›</button>
+    </div>
+    <div class="sub" id="subtitle"></div>
+  </header>
+  <main id="view"></main>
+  <nav class="tabbar" id="tabbar">
+    <button data-tab="week"><span class="ic">🍚</span>本周</button>
+    <button data-tab="shop"><span class="ic">🛒</span>采购</button>
+    <button data-tab="lib"><span class="ic">📖</span>菜库</button>
+    <button data-tab="inv"><span class="ic">🧊</span>库存</button>
+    <button data-tab="set"><span class="ic">⚙️</span>设置</button>
+  </nav>
+</div>
+<div id="backdrop"></div>
+<div id="sheet"></div>
+<div class="toast" id="toast"></div>
+<script src="data/bundle.js"></script>
+<script src="core.js"></script>
+<script src="app.js"></script>
+<script>
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW 注册失败（可能不是 https）', e));
+  });
+}
+</script>
+</body>
+</html>

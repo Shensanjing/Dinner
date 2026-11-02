@@ -1,0 +1,25 @@
+{
+  "name": "今晚吃什么 · 家庭晚餐计划",
+  "short_name": "今晚吃什么",
+  "description": "一周晚餐排期、食材用量、卡路里与七鲜采购清单",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./index.html",
+  "scope": "./",
+  "id": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#fdf7f1",
+  "theme_color": "#fdf7f1",
+  "categories": ["food", "lifestyle", "productivity"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "本周菜单", "url": "./index.html#week" },
+    { "name": "采购清单", "url": "./index.html#shop" }
+  ]
+}
