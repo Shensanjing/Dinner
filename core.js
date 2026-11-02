@@ -100,9 +100,13 @@
   }
 
   /* ---------- 主食 ---------- */
-  /* 1 碗＝标准家庭饭碗的熟饭 ≈ 150g 熟饭 ≈ 50g 生米 */
+  /* 1 碗＝标准家庭饭碗的熟饭 ≈ 150g 熟饭。
+     生米→熟饭的吸水率：白米加水约 1.5 倍（100g 生米 ≈ 250–300g 熟饭，
+     按《中国食物成分表》米饭 116 kcal/100g、大米 346 kcal/100g 反推 ≈ 300g）；
+     糙米吸水更多（1.6–1.7 倍水，糙米饭约 111 kcal/100g → 100g 生米 ≈ 310g 熟饭）。
+     所以同样一碗 150g 熟饭：白米约 50g 生米，糙米约 48g 生米。 */
   const STAPLE = {
-    brown: { key: 'brown_rice', name: '糙米饭', rawPerBowl: 50 },
+    brown: { key: 'brown_rice', name: '糙米饭', rawPerBowl: 48 },
     white: { key: 'rice', name: '米饭', rawPerBowl: 50 }
   };
   function stapleOf(state, meal) {
@@ -126,13 +130,17 @@
 
   function constraints(state) {
     const s = state.settings || {};
+    const stId = STAPLE[s.staple] ? s.staple : 'brown';
+    const rawPer = STAPLE[stId].rawPerBowl;
+    const grams = s.riceGrams == null ? 130 : s.riceGrams;
     return {
       weekdayMax: s.weekdayMax || 40,
       weekendMax: s.weekendMax || 120,
       spicyNights: s.spicyNights == null ? 3 : s.spicyNights,
-      riceDefault: s.ricePerMeal == null ? 2 : s.ricePerMeal,
+      riceGrams: grams,
+      riceDefault: Math.round(grams / rawPer * 10) / 10,
       meatPerWeek: s.meatPerWeek == null ? 3 : s.meatPerWeek,
-      staple: STAPLE[s.staple] ? s.staple : 'brown'
+      staple: stId
     };
   }
 
@@ -266,11 +274,18 @@
   }
 
   /* ---------- 采购清单 ---------- */
+  /* 实付校准：用户下单后回填实际付款，之后所有预估按这个系数缩放 */
+  function priceFactor(state) {
+    const f = state && state.priceFactor;
+    return typeof f === 'number' && f > 0.3 && f < 1.5 ? f : 1;
+  }
   function skuOf(key, state) {
     const it = ING[key];
     if (!it || !it.sku) return null;
     const ov = (state.skuOverride || {})[key];
-    return ov && ov.price ? { ...it.sku, price: ov.price, spec: ov.spec || it.sku.spec, specG: ov.specG || it.sku.specG } : it.sku;
+    const base = ov && ov.price ? { ...it.sku, price: ov.price, spec: ov.spec || it.sku.spec, specG: ov.specG || it.sku.specG } : it.sku;
+    const F = priceFactor(state);
+    return F === 1 ? base : { ...base, price: Math.round(base.price * F * 100) / 100 };
   }
   /* 剩余的包内食材能否留到下一单：能冷冻的按 30 天，否则按保质期 */
   function keepDays(key) {
@@ -307,7 +322,7 @@
           const d = DISH[id]; if (!d) return;
           const scale = Math.max(1, (m.eaters && m.eaters.length) || eaters);
           d.ing.forEach(x => {
-            if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked') return;
+            if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water') return;
             const grams = x.g * scale;
             if (x.opt) { b.optSet = b.optSet || {}; b.optSet[x.key] = (b.optSet[x.key] || 0) + grams; return; }
             b.needs[x.key] = (b.needs[x.key] || 0) + grams;
@@ -381,6 +396,8 @@
       const order = ['肉禽蛋', '水产', '蔬菜', '菌菇', '豆制品', '水果', '主食', '乳品'];
       b.items.sort((x, y) => (order.indexOf(x.cat) - order.indexOf(y.cat)) || (y.price - x.price));
       b.total = Math.round(b.total * 100) / 100;
+      b.factor = priceFactor(state);
+      b.rawTotal = Math.round(b.total / b.factor * 100) / 100;   // 未校准的标价合计，回填实付时用它算比例
       b.ship = b.total > 0 && b.total < 39 ? 3 : 0;
       b.gap = b.total > 0 ? Math.round((39 - b.total) * 100) / 100 : 0;
       b.pay = Math.round((b.total + b.ship) * 100) / 100;
@@ -408,9 +425,17 @@
     return lines.join('\n');
   }
 
+  /* 推荐新菜式（不在用户菜谱里，标"未尝试"） */
+  const SUGGEST = ((root.DATA && root.DATA.suggest) || []).slice();
+  /* 用户"加进我的菜谱"的菜（含从推荐里收的）：启动时并回 DISH，排期和采购就都认了 */
+  function hydrateCustom(state) {
+    ((state && state.custom) || []).forEach(d => { if (d && d.id && !DISH[d.id]) DISH[d.id] = d; });
+  }
+
   root.Core = {
-    DAY, WEEK_CN, DISH, ING, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
+    DAY, WEEK_CN, DISH, ING, SUGGEST, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
-    invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal
+    invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal,
+    priceFactor, hydrateCustom
   };
 })(typeof window !== 'undefined' ? window : globalThis);

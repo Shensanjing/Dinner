@@ -21,24 +21,34 @@
     ];
   }
   const DEF = () => ({
-    v: 2, tab: 'week', weekStart: C.mondayOf(today()),
-    plans: {}, inventory: seedInventory(), pantry: {},
+    v: 3, tab: 'week', weekStart: C.mondayOf(today()),
+    plans: {}, inventory: seedInventory(), pantry: {}, custom: [],
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
-      weekdayMax: 40, weekendMax: 60, ricePerMeal: 2, spicyNights: 3,
+      weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
       meatPerWeek: 3, staple: 'brown'
     },
-    skuOverride: {}, checked: {}, batch: 0, seen: false
+    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}
   });
   let S;
   try { S = JSON.parse(localStorage.getItem(LS)) || DEF(); } catch (e) { S = DEF(); }
   Object.keys(DEF()).forEach(k => { if (S[k] === undefined) S[k] = DEF()[k]; });
   Object.keys(DEF().settings).forEach(k => { if (S.settings[k] === undefined) S.settings[k] = DEF().settings[k]; });
-  /* 老版本迁移：周末上限 120 太松，会把大菜排到周末；主食默认改成糙米 */
+  /* 老版本迁移 */
   if (!S.v || S.v < 2) {
-    if (S.settings.weekendMax > 60) S.settings.weekendMax = 60;
+    if (S.settings.weekendMax > 60) S.settings.weekendMax = 60;   // 120 太松，会把大菜排到周末
     S.v = 2;
   }
+  if (!S.v || S.v < 3) {
+    /* v2 存的是"每顿几碗"，改成克：一碗糙米按 48g、白米按 50g 生米算 */
+    const st = C.STAPLE[S.settings.staple] ? S.settings.staple : 'brown';
+    if (S.settings.riceGrams == null) {
+      S.settings.riceGrams = Math.round((S.settings.ricePerMeal == null ? 2 : S.settings.ricePerMeal) * C.STAPLE[st].rawPerBowl);
+    }
+    delete S.settings.ricePerMeal;
+    S.v = 3;
+  }
+  C.hydrateCustom(S);   // 用户自己收进菜谱的菜要能被排期和采购认出来
   const save = () => { try { localStorage.setItem(LS, JSON.stringify(S)); } catch (e) { toast('存储失败：空间不足'); } };
 
   let toastTimer;
@@ -182,6 +192,9 @@
         <div class="muted">${b.total >= 39 ? '已满 ¥39，免运费'
           : (fix ? `还差 ${C.yuan(39 - b.total)} —— 加 ${esc(fix.name)} ¥${fix.price} 就够（合计 ${C.yuan(b.total + fix.price)}）`
                  : `还差 ${C.yuan(39 - b.total)} 免运费（现在 +¥3）`)}</div>
+        <div class="muted" style="margin-top:4px">${b.factor !== 1
+          ? `已按实付校准 ×${b.factor.toFixed(2)}（标价合计 ${C.yuan(b.rawTotal)}）`
+          : '金额按七鲜标价估算'} · <span class="link" data-act="paid" data-arg="${bi}">回填实付</span></div>
         <div class="covers">这一单吃 ${b.covers.length} 顿：${b.covers.map(c =>
           `<span class="${c.week === 'adj' ? 'adj' : ''}">${C.WEEK_CN[C.dow(c.date)]} ${C.md(c.date)}</span>`).join(' · ')}</div>
       </div>` : `
@@ -215,27 +228,38 @@
         <div class="muted" style="margin-top:6px">你在「库存」里标了待补。七鲜没有固定规格价，没算进金额；买完点回「充足」就行。</div>
       </div>` : ''}
       <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="copy" data-arg="${bi}">复制清单</button></div>
-      <div class="hint">价格为七鲜标价估算：券后实付通常是标价的 90–100%。买完可在「库存」里记一笔，下次自动扣减。</div>`;
+      <div class="hint">买完回来点「回填实付」，填一次七鲜的真实扣款，之后所有估价都按你的券后价来（现在是 ${
+        b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。</div>`;
   }
 
   /* ---------------- 菜库 ---------------- */
-  let libQ = '', libKind = '';
+  let libQ = '', libKind = '', libTab = 'mine';
+  const customIds = () => new Set((S.custom || []).map(d => d.id));
   function viewLib() {
-    const list = Object.values(DISH).filter(d =>
+    const mine = Object.values(DISH).filter(d => !d.src || d.src !== 'suggest' || customIds().has(d.id));
+    const fresh = (C.SUGGEST || []).filter(d => !customIds().has(d.id));
+    const base = libTab === 'new' ? fresh : mine;
+    const list = base.filter(d =>
       (!libKind || d.kind === libKind) &&
       (!libQ || d.name.includes(libQ) || d.ing.some(i => i.name.includes(libQ))));
     $('#view').innerHTML = `
+      <div class="chips" style="margin-bottom:8px">
+        <button class="chip ${libTab === 'mine' ? 'on' : ''}" data-act="libtab" data-arg="mine">我的菜谱 ${mine.length}</button>
+        <button class="chip ${libTab === 'new' ? 'on' : ''}" data-act="libtab" data-arg="new">新菜推荐 ${fresh.length}</button>
+      </div>
       <input type="text" id="libq" placeholder="搜菜名或食材，比如：茄子" value="${esc(libQ)}">
       <div class="chips" style="margin-top:10px">
         ${['', 'meat', 'half', 'veg', 'onepot'].map(k =>
           `<button class="chip ${libKind === k ? 'on' : ''}" data-act="libkind" data-arg="${k}">${k ? KIND[k] : '全部'}</button>`).join('')}
       </div>
-      <div class="muted" style="margin:2px 2px 8px">${list.length} 道</div>
+      <div class="muted" style="margin:2px 2px 8px">${list.length} 道${libTab === 'new' ? ' · 没做过的，试过觉得行就收进菜谱' : ''}</div>
       ${list.map(d => `<div class="card" style="padding:11px 14px" data-act="dish" data-arg="${d.id}">
         <div class="row"><span class="dish-name" style="font-size:15.5px">${esc(d.name)}</span>
+        ${libTab === 'new' ? '<span class="badge warn">未尝试</span>' : ''}
         ${d.spice >= 2 ? '<span class="badge spicy">辣</span>' : ''}
         <span class="sp"></span><span class="muted">${d.kcal} kcal</span></div>
-        <div class="dish-meta">${KIND[d.kind]} · ${d.min} 分钟 · ${d.ing.length} 种食材 · ${C.yuan(C.dishCost(d))}</div>
+        <div class="dish-meta">${KIND[d.kind]} · ${d.min} 分钟 · ${d.ing.length} 种食材 · ${C.yuan(C.dishCost(d))}${
+          libTab === 'new' ? ` · <span class="link" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</span>` : ''}</div>
       </div>`).join('')}`;
     const q = $('#libq');
     q.oninput = e => { libQ = e.target.value; viewLib(); $('#libq').focus(); };
@@ -305,8 +329,20 @@
         <input type="number" value="${s.weekdayMax}" data-act="setnum" data-arg="weekdayMax">
         <label class="fld">周末最多做多久（分钟）</label>
         <input type="number" value="${s.weekendMax}" data-act="setnum" data-arg="weekendMax">
-        <label class="fld">每顿吃几碗饭（1 碗熟饭 ≈ 150g ≈ 50g 生米）</label>
-        <input type="number" value="${s.ricePerMeal}" data-act="setnum" data-arg="ricePerMeal">
+        <label class="fld">每顿吃多少米（生米克数）</label>
+        <div class="row" style="gap:8px">
+          <input type="number" value="${s.riceGrams}" data-act="setrice" style="flex:1">
+          <span class="muted" style="white-space:nowrap">≈ ${Math.round(s.riceGrams / C.STAPLE[s.staple || 'brown'].rawPerBowl * 10) / 10} 碗${C.STAPLE[s.staple || 'brown'].name}</span>
+        </div>
+        <div class="muted" style="margin-bottom:10px">1 碗熟饭按 150g 算：白米约 50g 生米、糙米约 48g（糙米蒸的时候吸水更多）。</div>
+      </div>
+      <div class="sec-title">价格</div>
+      <div class="card">
+        <div class="row"><span>按实付校准</span><span class="sp"></span>
+          <b>×${(S.priceFactor || 1).toFixed(2)}</b></div>
+        <div class="muted" style="margin-top:6px">在「采购」里点「回填实付」填一次真实扣款，所有金额就按你的券后价估。${
+          S.priceFactor && S.priceFactor !== 1 ? '' : '现在还是七鲜标价。'}</div>
+        ${S.priceFactor && S.priceFactor !== 1 ? '<button class="btn block" style="margin-top:8px" data-act="resetprice">恢复标价</button>' : ''}
       </div>
       <div class="sec-title">数据</div>
       <div class="card">
@@ -317,12 +353,13 @@
       </div>
       <div class="sec-title">关于</div>
       <div class="card muted" style="font-size:12.5px;line-height:1.7">
-        v0.2 · 菜谱来自你的 53 道家常菜；价格为七鲜标价（¥39 免运费，未满 +¥3）。<br>
+        v0.3 · 菜谱 53 道 + 20 道新菜推荐；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
         数字都是查表算的：卡路里按食材克数 × 每 100g 热量（含主食）；成本按整包价折算。
       </div>`;
     document.querySelectorAll('[data-act=pname]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].name = e.target.value; save(); });
     document.querySelectorAll('[data-act=pportion]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].portion = +e.target.value; save(); });
     document.querySelectorAll('[data-act=setnum]').forEach(el => el.onchange = e => { S.settings[el.dataset.arg] = +e.target.value; save(); });
+    document.querySelectorAll('[data-act=setrice]').forEach(el => el.onchange = e => ACT.setrice(e.target.value));
   }
 
   /* ---------------- 渲染 ---------------- */
@@ -392,6 +429,7 @@
       <table class="tbl">${sea}</table>
       <div class="sec-title">做法</div>
       <ol class="steps">${d.steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol>
+      ${d.src === 'suggest' ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</button></div>` : ''}
       <div class="row" style="margin-top:14px"><button class="btn block" data-act="close">关闭</button></div>`);
   }
 
@@ -450,6 +488,20 @@
   }
 
   /* ---------------- 动作 ---------------- */
+  const riceFor = kind => (kind === 'onepot' ? 0 : C.constraints(S).riceDefault);
+  function sheetPaid() {
+    const sh = C.shopping(S.weekStart, S), b = sh.batches[Math.min(shopBatch, sh.batches.length - 1)];
+    const est = b.total, raw = b.rawTotal || est;
+    showSheet(`
+      <h2>回填实付</h2>
+      <div class="sheet-sub">${b.name} · ${b.deliver} · 预估 ${C.yuan(est)}（标价 ${C.yuan(raw)}）</div>
+      <label class="fld">七鲜实际付了多少钱</label>
+      <input type="number" id="paidv" value="${est.toFixed(2)}" step="0.01">
+      <div class="hint" style="margin-top:8px">填完以后，所有金额都按这个比例缩放（含运费前的标价口径），下次估价就更准。</div>
+      <div class="row" style="margin-top:14px"><button class="btn primary block" data-act="setpaid">保存校准</button></div>`);
+    const el = $('#paidv'); el.focus(); el.select();
+  }
+
   function setMeal(date, patch) {
     const p = S.plans[S.weekStart] || (S.plans[S.weekStart] = { weekStart: S.weekStart, days: [] });
     let m = p.days.find(x => x.date === date);
@@ -476,7 +528,7 @@
       if (locked.some(l => l.date === m.date)) return;
       if (usedByLocked.has(m.dishes[0])) {
         const alt = Object.values(DISH).filter(d => !usedByLocked.has(d.id) && d.min <= (C.dow(m.date) % 6 === 0 ? S.settings.weekendMax : S.settings.weekdayMax));
-        if (alt.length) { m.dishes = [alt[Math.floor(Math.random() * alt.length)].id]; const d = DISH[m.dishes[0]]; m.protein = C.mainProtein(d); m.rice = d.kind === 'onepot' ? 0 : S.settings.ricePerMeal; }
+        if (alt.length) { m.dishes = [alt[Math.floor(Math.random() * alt.length)].id]; const d = DISH[m.dishes[0]]; m.protein = C.mainProtein(d); m.rice = riceFor(d.kind); }
       }
     });
     S.plans[S.weekStart] = np; save(); render();
@@ -489,7 +541,7 @@
     close: () => hideSheet(),
     picker: d => sheetPicker(d),
     pickkind: k => { pickKind = k; sheetPicker(CURRENT_PICK); },
-    pick: a => { const [date, id] = a.split('|'); const d = DISH[id]; setMeal(date, { dishes: [id], status: 'cook', rice: d.kind === 'onepot' ? 0 : S.settings.ricePerMeal }); hideSheet(); toast('已换成 ' + d.name); },
+    pick: a => { const [date, id] = a.split('|'); const d = DISH[id]; setMeal(date, { dishes: [id], status: 'cook', rice: riceFor(d.kind) }); hideSheet(); toast('已换成 ' + d.name); },
     out: d => { const m = mealAt(S.weekStart, d); setMeal(d, { status: m && m.status === 'out' ? 'cook' : 'out' }); hideSheet(); toast(m && m.status === 'out' ? '改回在家吃' : '这顿外食，食材留到下一顿'); },
     lock: d => { const m = mealAt(S.weekStart, d); setMeal(d, { locked: !(m && m.locked) }); hideSheet(); },
     rice: d => { const m = mealAt(S.weekStart, d); setMeal(d, { rice: ((m && m.rice) || 0) + 1 > 4 ? 0 : ((m && m.rice) || 0) + 1 }); sheetMeal(d); },
@@ -505,6 +557,32 @@
     batch: i => { shopBatch = +i; viewShop(); },
     chk: a => { const [bi, key] = a.split(':'); const k = S.weekStart + ':' + bi; S.checked[k] = S.checked[k] || {}; S.checked[k][key] = !S.checked[k][key]; save(); viewShop(); },
     libkind: k => { libKind = k; viewLib(); },
+    libtab: k => { libTab = k; viewLib(); },
+    addcustom: id => {
+      const d = (C.SUGGEST || []).find(x => x.id === id);
+      if (!d || customIds().has(id)) return;
+      S.custom = S.custom || [];
+      S.custom.push(d);
+      C.hydrateCustom(S);
+      save();
+      libTab = 'mine'; libKind = ''; libQ = '';
+      viewLib();
+      toast(`${d.name} 已加进菜谱`);
+    },
+    paid: i => sheetPaid(+i),
+    setpaid: () => {
+      const v = +$('#paidv').value;
+      if (!(v > 0)) return toast('填一下实付金额');
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[shopBatch];
+      const f = Math.max(0.5, Math.min(1.3, v / (b.rawTotal || b.total || 1)));
+      S.priceFactor = Math.round(f * 1000) / 1000;
+      S.paid = S.paid || {};
+      S.paid[S.weekStart + ':' + (b.order || shopBatch)] = { est: b.total, paid: Math.round(v * 100) / 100, at: today() };
+      save(); hideSheet(); viewShop();
+      toast(`已校准：以后按标价的 ${Math.round(S.priceFactor * 100)}% 估`);
+    },
+    resetprice: () => { S.priceFactor = 1; S.paid = {}; save(); viewShop(); toast('已恢复七鲜标价'); },
+    setrice: v => { S.settings.riceGrams = Math.max(30, Math.min(500, +v || 130)); save(); viewSet(); },
     setmeat: n => { S.settings.meatPerWeek = +n; save(); viewSet(); },
     setstaple: k => { S.settings.staple = k; save(); viewSet(); },
     goto: t => { S.tab = t; save(); render(); },
@@ -584,6 +662,7 @@
     const ui = qs.get('ui');
     if (ui) {
       if (ui.startsWith('dish:')) sheetDish(ui.slice(5), 1);
+      else if (ui.startsWith('lib:')) { S.tab = 'lib'; libTab = ui.slice(4) || 'mine'; render(); }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
     }
