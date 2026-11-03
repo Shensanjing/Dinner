@@ -9,6 +9,7 @@
   const today = () => { const d = new Date(); return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`; };
   const num = n => Math.round(n * 10) / 10;
   const unitTxt = v => String(Math.round(v * 10) / 10);
+  const uid = () => 'i' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
   /* ---------------- 状态 ---------------- */
   function seedInventory() {
@@ -18,17 +19,17 @@
       { key: 'ginger', g: 200, exp: d(25) }, { key: 'scallion', g: 300, exp: d(12) },
       { key: 'egg', g: 1650, exp: d(21) }, { key: 'wood_ear', g: 80, exp: d(300) },
       { key: 'flour', g: 1000, exp: d(200) }
-    ];
+    ].map(x => ({ id: uid(), ...x }));
   }
   const DEF = () => ({
     v: 3, tab: 'week', weekStart: C.mondayOf(today()),
-    plans: {}, inventory: seedInventory(), pantry: {}, custom: [],
+    plans: {}, inventory: seedInventory(), pantry: {}, custom: [], archived: [], customIng: [],
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
       weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
       meatPerWeek: 3, staple: 'brown'
     },
-    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}
+    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {}
   });
   let S;
   try { S = JSON.parse(localStorage.getItem(LS)) || DEF(); } catch (e) { S = DEF(); }
@@ -49,6 +50,15 @@
     S.v = 3;
   }
   C.hydrateCustom(S);   // 用户自己收进菜谱的菜要能被排期和采购认出来
+  /* 库存记录补唯一 id：以前按下标删，列表按到期日排序后会删错行 */
+  S.archived = S.archived || [];
+  (S.inventory || []).forEach(x => { if (!x.id) x.id = uid(); });
+  /* 自定义食材：买了菜谱里没有的东西（藕、秋葵、某个牌子的酸奶），也要能进库存 */
+  const ING_CATS = ['肉禽蛋', '水产', '蔬菜', '菌菇', '豆制品', '水果', '主食', '乳品', '调料', '其他'];
+  function hydrateIng() {
+    (S.customIng || []).forEach(it => { if (it && it.key && !C.ING[it.key]) C.ING[it.key] = it; });
+  }
+  hydrateIng();
   const save = () => { try { localStorage.setItem(LS, JSON.stringify(S)); } catch (e) { toast('存储失败：空间不足'); } };
 
   let toastTimer;
@@ -122,7 +132,7 @@
         <span class="day-name">${C.WEEK_CN[C.dow(m.date)]}</span>
         <span class="day-date">${mo}.${da}</span>
         ${isToday ? '<span class="badge">今天</span>' : ''}
-        <span class="sp"></span>${freshBadge(m)}${m.locked ? '<span class="badge">🔒 锁定</span>' : ''}
+        <span class="sp"></span>${m.done ? '<span class="badge ok">✓ 已做</span>' : ''}${freshBadge(m)}${m.locked ? '<span class="badge">🔒 锁定</span>' : ''}
       </div>${inner}</div>`;
   }
   function viewWeek() {
@@ -205,6 +215,7 @@
           `<span class="${c.week === 'adj' ? 'adj' : ''}">${C.WEEK_CN[C.dow(c.date)]} ${C.md(c.date)}</span>`).join(' · ')}</div>
       </div>`;
     $('#view').innerHTML = `
+      ${sh.batches.every(x => !x.items.length) ? `<div class="hint" style="margin-bottom:10px">这一周的食材家里都有，<b>不用下单</b>。想少花点钱的话，可以把「一周做几顿荤菜」调高一点，多吃点冰箱里的。</div>` : ''}
       <div class="batch-tabs">${sh.batches.map((x, i) =>
         `<button class="chip ${i === bi ? 'on' : ''}" data-act="batch" data-arg="${i}">${x.name}</button>`).join('')}</div>
       ${sumCard}
@@ -227,24 +238,36 @@
         <div class="row"><span>${b.restock.map(r => esc(r.name)).join('、')}</span></div>
         <div class="muted" style="margin-top:6px">你在「库存」里标了待补。七鲜没有固定规格价，没算进金额；买完点回「充足」就行。</div>
       </div>` : ''}
-      <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="copy" data-arg="${bi}">复制清单</button></div>
-      <div class="hint">买完回来点「回填实付」，填一次七鲜的真实扣款，之后所有估价都按你的券后价来（现在是 ${
+      <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="buy" data-arg="${bi}">${b.ordered ? '这单已记进库存（点一下撤销）' : '这单买了 → 记进库存'}</button></div>
+      <div class="row" style="margin-top:-6px;margin-bottom:14px"><button class="btn block" data-act="copy" data-arg="${bi}">复制清单</button></div>
+      <div class="hint">点「这单买了」以后，整包的量会进库存，后面的排期和采购会自动扣掉，不用再买第二遍。
+        买完回来点「回填实付」，填一次真实扣款，之后所有估价都按你的券后价来（现在是 ${
         b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。</div>`;
   }
 
   /* ---------------- 菜库 ---------------- */
   let libQ = '', libKind = '', libTab = 'mine';
   const customIds = () => new Set((S.custom || []).map(d => d.id));
+  const archIds = () => new Set(S.archived || []);
+  const dishById = id => DISH[id] || (C.SUGGEST || []).find(x => x.id === id);
+  /* 我的菜谱：原始 53 道去掉移出的，再加上自己收编的 */
+  const isMine = d => (!d.src || d.src !== 'suggest' || customIds().has(d.id)) && !archIds().has(d.id);
   function viewLib() {
-    const mine = Object.values(DISH).filter(d => !d.src || d.src !== 'suggest' || customIds().has(d.id));
-    const fresh = (C.SUGGEST || []).filter(d => !customIds().has(d.id));
-    const base = libTab === 'new' ? fresh : mine;
+    const all = Object.values(DISH);
+    const mine = all.filter(isMine);
+    const arch = (S.archived || []).map(dishById).filter(Boolean);
+    const fresh = (C.SUGGEST || []).filter(d => !customIds().has(d.id) && !archIds().has(d.id));
+    const base = libTab === 'new' ? fresh : (libTab === 'arch' ? arch : mine);
     const list = base.filter(d =>
       (!libKind || d.kind === libKind) &&
       (!libQ || d.name.includes(libQ) || d.ing.some(i => i.name.includes(libQ))));
+    const tip = libTab === 'new' ? ' · 没做过的，试过觉得行就收进菜谱'
+      : libTab === 'arch' ? ' · 移出来的菜不参与自动排期，想吃了再加回去'
+        : ' · 不想再吃的点「移出」';
     $('#view').innerHTML = `
       <div class="chips" style="margin-bottom:8px">
         <button class="chip ${libTab === 'mine' ? 'on' : ''}" data-act="libtab" data-arg="mine">我的菜谱 ${mine.length}</button>
+        <button class="chip ${libTab === 'arch' ? 'on' : ''}" data-act="libtab" data-arg="arch">备选库 ${arch.length}</button>
         <button class="chip ${libTab === 'new' ? 'on' : ''}" data-act="libtab" data-arg="new">新菜推荐 ${fresh.length}</button>
       </div>
       <input type="text" id="libq" placeholder="搜菜名或食材，比如：茄子" value="${esc(libQ)}">
@@ -252,15 +275,18 @@
         ${['', 'meat', 'half', 'veg', 'onepot'].map(k =>
           `<button class="chip ${libKind === k ? 'on' : ''}" data-act="libkind" data-arg="${k}">${k ? KIND[k] : '全部'}</button>`).join('')}
       </div>
-      <div class="muted" style="margin:2px 2px 8px">${list.length} 道${libTab === 'new' ? ' · 没做过的，试过觉得行就收进菜谱' : ''}</div>
+      <div class="muted" style="margin:2px 2px 8px">${list.length} 道${tip}</div>
       ${list.map(d => `<div class="card" style="padding:11px 14px" data-act="dish" data-arg="${d.id}">
         <div class="row"><span class="dish-name" style="font-size:15.5px">${esc(d.name)}</span>
-        ${libTab === 'new' ? '<span class="badge warn">未尝试</span>' : ''}
+        ${d.src === 'suggest' && !customIds().has(d.id) ? '<span class="badge warn">未尝试</span>' : ''}
         ${d.spice >= 2 ? '<span class="badge spicy">辣</span>' : ''}
         <span class="sp"></span><span class="muted">${d.kcal} kcal</span></div>
-        <div class="dish-meta">${KIND[d.kind]} · ${d.min} 分钟 · ${d.ing.length} 种食材 · ${C.yuan(C.dishCost(d))}${
-          libTab === 'new' ? ` · <span class="link" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</span>` : ''}</div>
-      </div>`).join('')}`;
+        <div class="dish-meta">${KIND[d.kind]} · ${d.min} 分钟 · ${d.ing.length} 种食材 · ${C.yuan(C.dishCost(d))}
+          ${libTab === 'mine' ? `<span class="link" data-act="archive" data-arg="${d.id}">移出</span>` : ''}
+          ${libTab === 'arch' ? `<span class="link" data-act="restore" data-arg="${d.id}">加回菜谱</span>` : ''}
+          ${libTab === 'new' ? `<span class="link" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</span>` : ''}
+        </div>
+      </div>`).join('') || '<div class="card"><div class="muted" style="text-align:center;padding:16px 0">这里面还没有菜</div></div>'}`;
     const q = $('#libq');
     q.oninput = e => { libQ = e.target.value; viewLib(); $('#libq').focus(); };
   }
@@ -279,16 +305,17 @@
     const low = pt.filter(i => S.pantry[i.key] === 'low');
     $('#view').innerHTML = `
       ${soon.length ? `<div class="hint" style="margin-bottom:10px">临期 ${soon.length} 样：${soon.map(x => esc((ING[x.key] || {}).name || x.key)).join('、')} —— 优先安排吃掉</div>` : ''}
-      <div class="card">${items.map((x, i) => {
+      <div class="card">${items.map(x => {
         const it = ING[x.key] || {};
         const left = x.exp ? C.dspan(today(), x.exp) : null;
         const soon2 = left !== null && left <= 2;
-        return `<div class="item">
+        return `<div class="item" data-act="editinv" data-arg="${x.id}">
           <div style="flex:1"><div class="nm">${esc(it.name || x.key)}</div>
           <div class="sk">${invText(it, x.g)}${x.exp ? ` · <span style="${soon2 ? 'color:#b7791f' : ''}">${left < 0 ? '已过期' : left + ' 天后到期'}</span>` : ''}</div></div>
-          <button class="btn" style="padding:5px 10px;font-size:12px" data-act="delinv" data-arg="${i}">删</button>
+          <button class="btn" style="padding:5px 10px;font-size:12px" data-act="delinv" data-arg="${x.id}">删</button>
         </div>`;
       }).join('') || '<div class="muted">还没有记录。买回来的东西先记一笔，排菜时自动扣。</div>'}</div>
+      <div class="hint" style="margin-bottom:10px">点任意一条可以改数量、改保质期。</div>
       <button class="btn primary block" data-act="addinv">＋ 记一笔库存</button>
       <div class="sec-title">常备调料（点一下切换）</div>
       <div class="card">
@@ -353,7 +380,7 @@
       </div>
       <div class="sec-title">关于</div>
       <div class="card muted" style="font-size:12.5px;line-height:1.7">
-        v0.3 · 菜谱 53 道 + 20 道新菜推荐；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
+        v0.4 · 菜谱 53 道 + 20 道新菜推荐，不想吃的可以移进备选库；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
         数字都是查表算的：卡路里按食材克数 × 每 100g 热量（含主食）；成本按整包价折算。
       </div>`;
     document.querySelectorAll('[data-act=pname]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].name = e.target.value; save(); });
@@ -365,7 +392,13 @@
   /* ---------------- 渲染 ---------------- */
   const TABS = ['week', 'shop', 'lib', 'inv', 'set'];
   function syncHash() { try { if (location.hash !== '#' + S.tab) history.replaceState(null, '', '#' + S.tab); } catch (e) {} }
+  /* 老备份导入的库存可能没有 id，渲染前补齐（删改都靠 id，不再靠下标） */
+  function ensureInvIds() {
+    (S.inventory || []).forEach(x => { if (!x.id) x.id = uid(); });
+    if (!Array.isArray(S.archived)) S.archived = [];
+  }
   function render() {
+    ensureInvIds();
     renderTop();
     ({ week: viewWeek, shop: viewShop, lib: viewLib, inv: viewInv, set: viewSet }[S.tab] || viewWeek)();
     syncHash();
@@ -395,16 +428,17 @@
       </div>` : ''}
       <div class="act-list">
         <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '换一道' : '选一道菜'}</button>
+        <button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>
         <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : '今天出去吃'}</button>
         <button class="act" data-act="lock" data-arg="${date}"><span class="em">🔒</span>${m.locked ? '解锁这顿' : '锁定这顿（重排时不动）'}</button>
-        <button class="act" data-act="rice" data-arg="${date}"><span class="em">🍚</span>${st.name}：${m.rice || 0} 碗${m.rice ? `（生米 ${num(m.rice * st.rawPerBowl)}g）` : ''}</button>
+        <button class="act" data-act="rice" data-arg="${date}"><span class="em">🍚</span>${st.name}：${m.rice || 0} 碗${m.rice ? `（生米 ${Math.round(m.rice * st.rawPerBowl)}g）` : ''}</button>
         <button class="act" data-act="staple" data-arg="${date}"><span class="em">🌾</span>这顿换成${st.id === 'brown' ? '白米饭' : '糙米饭'}</button>
         <button class="act danger" data-act="clear" data-arg="${date}"><span class="em">🗑</span>清空这顿</button>
       </div>`);
   }
 
   function sheetDish(id, eaters) {
-    const d = DISH[id]; if (!d) return;
+    const d = dishById(id); if (!d) return;
     const k = Math.max(1, eaters || 1);
     const ing = d.ing.map(x => {
       const u = x.unit || '';
@@ -429,7 +463,8 @@
       <table class="tbl">${sea}</table>
       <div class="sec-title">做法</div>
       <ol class="steps">${d.steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol>
-      ${d.src === 'suggest' ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</button></div>` : ''}
+      ${d.src === 'suggest' && !customIds().has(d.id) ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</button></div>` : ''}
+      ${archIds().has(d.id) ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="restore" data-arg="${d.id}">加回菜谱</button></div>` : ''}
       <div class="row" style="margin-top:14px"><button class="btn block" data-act="close">关闭</button></div>`);
   }
 
@@ -438,7 +473,7 @@
     const cur = mealAt(S.weekStart, date);
     const used = new Set();
     (plan(S.weekStart) || { days: [] }).days.forEach(m => { if (m.date !== date) (m.dishes || []).forEach(x => used.add(x)); });
-    const list = Object.values(DISH).filter(d =>
+    const list = Object.values(DISH).filter(d => !archIds().has(d.id)).filter(d =>
       (!pickKind || d.kind === pickKind) &&
       (!pickQ || d.name.includes(pickQ) || d.ing.some(i => i.name.includes(pickQ))));
     const rows = list.slice(0, 60).map(d => {
@@ -465,10 +500,18 @@
 
   function sheetAddInv() {
     const opts = Object.values(ING).filter(i => i.sku).map(i => `<option value="${i.key}">${esc(i.name)}</option>`).join('');
+    const mine = (S.customIng || []).map(i => `<option value="${i.key}">${esc(i.name)}</option>`).join('');
     showSheet(`
       <h2>记一笔库存</h2>
       <div class="sheet-sub">比如：鸡蛋 10 枚、牛肉 2000g 冷冻 60 天</div>
-      <label class="fld">食材</label><select id="invkey">${opts}</select>
+      <label class="fld">食材</label>
+      <select id="invkey">${opts}${mine}<option value="__new__">＋ 菜谱里没有的，新建一个…</option></select>
+      <div id="newbox" style="display:none">
+        <label class="fld">它叫什么</label><input type="text" id="newname" placeholder="比如：藕、秋葵、无糖酸奶">
+        <label class="fld">归类</label>
+        <select id="newcat">${ING_CATS.map(c => `<option value="${c}">${c}</option>`).join('')}</select>
+        <div class="hint" style="margin-top:6px">归到「肉禽蛋／水产／蔬菜」这类会出现在采购清单的排序里；以后菜谱用不到它，只用来记库存也行。</div>
+      </div>
       <label class="fld">数量</label>
       <div class="row" style="gap:8px">
         <input type="number" id="invg" value="1" style="flex:1">
@@ -477,14 +520,37 @@
       <label class="fld">还能放几天</label><input type="number" id="invdays" value="7">
       <div class="row" style="margin-top:14px"><button class="btn primary block" data-act="saveinv">保存</button></div>`);
     const sel = $('#invkey'), un = $('#invunit'), gEl = $('#invg'), dEl = $('#invdays');
+    const box = $('#newbox');
     const sync = () => {
-      const it = ING[sel.value] || {};
+      const isNew = sel.value === '__new__';
+      box.style.display = isNew ? 'block' : 'none';
+      const it = isNew ? {} : (ING[sel.value] || {});
       const units = ['g'].concat(it.unit ? [it.unit] : []);
       un.innerHTML = units.map(u => `<option value="${u}">${u === 'g' ? '克' : u}</option>`).join('');
-      gEl.value = it.unit && it.per ? 1 : (it.sku && it.sku.specG ? it.sku.specG : 500);
-      dEl.value = it.freeze > 0 ? Math.min(60, it.freeze) : 7;
+      gEl.value = isNew ? 500 : (it.unit && it.per ? 1 : (it.sku && it.sku.specG ? it.sku.specG : 500));
+      dEl.value = isNew ? 7 : (it.freeze > 0 ? Math.min(60, it.freeze) : (it.shelf || 7));
     };
     sel.onchange = sync; sync();
+  }
+
+  function sheetEditInv(id) {
+    const x = (S.inventory || []).find(v => v.id === id); if (!x) return;
+    const it = ING[x.key] || {};
+    const byPiece = it.unit && it.per && it.per >= 15;
+    const days = x.exp ? Math.max(0, C.dspan(today(), x.exp)) : 7;
+    showSheet(`
+      <h2>${esc(it.name || x.key)}</h2>
+      <div class="sheet-sub">${x.exp ? '现在记的是 ' + x.exp + ' 到期' : '没记保质期'}</div>
+      <label class="fld">数量</label>
+      <div class="row" style="gap:8px">
+        <input type="number" id="edg" value="${byPiece ? Math.round(x.g / it.per * 10) / 10 : x.g}" style="flex:1">
+        <select id="edunit" style="width:104px">
+          ${(byPiece ? [it.unit, 'g'] : ['g']).map(u => `<option value="${u}">${u === 'g' ? '克' : u}</option>`).join('')}
+        </select>
+      </div>
+      <label class="fld">还能放几天</label><input type="number" id="eddays" value="${days}">
+      <div class="row" style="margin-top:14px"><button class="btn primary block" data-act="saveedit" data-arg="${id}">保存</button></div>
+      <div class="row" style="margin-top:8px"><button class="btn danger block" data-act="delinv" data-arg="${id}">删除这条</button></div>`);
   }
 
   /* ---------------- 动作 ---------------- */
@@ -569,6 +635,47 @@
       viewLib();
       toast(`${d.name} 已加进菜谱`);
     },
+    buy: bi => {
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+      if (!b) return;
+      S.ordered = S.ordered || {};
+      if (b.ordered) {                       // 点第二次 = 撤销
+        const rec = S.ordered[b.deliver];
+        if (rec && rec.added) {
+          const back = {};
+          rec.added.forEach(x => { back[x.key] = (back[x.key] || 0) + x.g; });
+          C.consumeInv(S, back);
+        }
+        delete S.ordered[b.deliver];
+        save(); viewShop(); toast('已撤销，库存扣回去了'); return;
+      }
+      if (!b.items.length) return toast('这单没有要买的东西');
+      const added = [];
+      b.items.forEach(x => {
+        const g = x.packs * x.specG;
+        C.addInv(S, x.key, g);
+        added.push({ key: x.key, g });
+      });
+      S.ordered[b.deliver] = { at: today(), total: b.pay, added };
+      save(); viewShop();
+      toast(`已记进库存：${added.length} 样`);
+    },
+    done: d => {
+      const m = mealAt(S.weekStart, d);
+      if (!m || !(m.dishes || []).length) return toast('这顿还没排菜');
+      if (m.done) {                          // 撤销：把扣掉的加回去
+        const back = m.deducted || {};
+        Object.keys(back).forEach(k => C.addInv(S, k, back[k]));
+        setMeal(d, { done: false, deducted: null });
+        save(); sheetMeal(d); toast('已撤销，库存加回去了'); return;
+      }
+      const needs = C.mealNeeds(S, m);
+      const r = C.consumeInv(S, needs);
+      setMeal(d, { done: true, deducted: r.used });
+      save(); sheetMeal(d);
+      const n = Object.keys(r.used).length, s = Object.keys(r.short).length;
+      toast(s ? `已扣库存 ${n} 样，其中 ${s} 样库存不够` : `已扣库存 ${n} 样`);
+    },
     paid: i => sheetPaid(+i),
     setpaid: () => {
       const v = +$('#paidv').value;
@@ -589,17 +696,57 @@
     addprofile: () => { S.profiles.push({ id: 'p' + Date.now(), name: '家人', portion: 1 }); save(); viewSet(); },
     addinv: () => sheetAddInv(),
     saveinv: () => {
-      const key = $('#invkey').value;
+      let key = $('#invkey').value;
       const v = +$('#invg').value || 0;
       const u = $('#invunit').value;
+      const days = +$('#invdays').value || 7;
+      if (key === '__new__') {
+        const nm = ($('#newname').value || '').trim();
+        if (!nm) return toast('先给它起个名字');
+        const cat = $('#newcat').value;
+        key = 'x' + Date.now().toString(36);
+        const made = { key, name: nm, cat, shelf: days, freeze: 0, unit: null, per: null, sku: null, pantry: false, kcal: 0, custom: true };
+        S.customIng = S.customIng || [];
+        S.customIng.push(made);
+        C.ING[key] = made;
+      }
       const it = ING[key] || {};
       const g = u === 'g' || !it.per ? v : Math.round(v * it.per * 10) / 10;
-      const days = +$('#invdays').value || 7;
-      S.inventory.push({ key, g, exp: C.addD(today(), days) });
-      save(); hideSheet(); render(); toast('已记录');
+      S.inventory.push({ id: uid(), key, g, exp: C.addD(today(), days) });
+      save(); hideSheet(); render();
+      toast(it.custom ? '已记录，下次能直接选它' : '已记录');
+    },
+    archive: id => {
+      const d = dishById(id); if (!d) return;
+      S.archived = S.archived || [];
+      if (S.archived.indexOf(id) < 0) S.archived.push(id);
+      save();
+      const inPlan = (plan(S.weekStart) || { days: [] }).days.some(m => (m.dishes || []).indexOf(id) >= 0);
+      libTab = 'mine'; viewLib();
+      toast(inPlan ? `${d.name} 已移出（本周计划里还在，想换掉点那顿）` : `${d.name} 已移到备选库`);
+    },
+    restore: id => {
+      S.archived = (S.archived || []).filter(x => x !== id);
+      save(); hideSheet();
+      if (S.tab === 'lib') { libTab = 'arch'; viewLib(); } else render();
+      toast('已加回菜谱');
+    },
+    editinv: id => sheetEditInv(id),
+    saveedit: id => {
+      const x = (S.inventory || []).find(v => v.id === id); if (!x) return;
+      const it = ING[x.key] || {};
+      const v = +$('#edg').value || 0, u = $('#edunit').value;
+      x.g = (u === 'g' || !it.per) ? v : Math.round(v * it.per * 10) / 10;
+      x.exp = C.addD(today(), Math.max(0, +$('#eddays').value || 0));
+      save(); hideSheet(); render(); toast('已更新');
     },
     ptoggle: key => { if (S.pantry[key] === 'low') delete S.pantry[key]; else S.pantry[key] = 'low'; save(); viewInv(); },
-    delinv: i => { S.inventory.splice(+i, 1); save(); viewInv(); },
+    delinv: id => {
+      const x = (S.inventory || []).find(v => v.id === id);
+      S.inventory = (S.inventory || []).filter(v => v.id !== id);
+      save(); hideSheet(); render();
+      toast(x ? `已删除 ${(ING[x.key] || {}).name || x.key}` : '已删除');
+    },
     export: () => {
       const blob = new Blob([JSON.stringify(S, null, 1)], { type: 'application/json' });
       const a = document.createElement('a');

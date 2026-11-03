@@ -47,6 +47,7 @@ main { flex: 1; padding: 12px 14px calc(84px + env(safe-area-inset-bottom)); }
 .badge.warn { background: var(--amber-soft); color: var(--amber); }
 .badge.out { background: #f1efee; color: #8b8178; }
 .badge.spicy { background: var(--accent-soft); color: var(--accent); }
+.badge.ok { background: var(--green-soft); color: var(--green); font-weight: 600; }
 .dish-line { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .dish-name { font-size: 17px; font-weight: 600; }
 .dish-meta { font-size: 12px; color: var(--ink2); margin-top: 2px; }
@@ -61,6 +62,8 @@ main { flex: 1; padding: 12px 14px calc(84px + env(safe-area-inset-bottom)); }
 .chips { display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 6px; scrollbar-width: none; }
 .chips.wrap { flex-wrap: wrap; overflow: visible; }
 .chips::-webkit-scrollbar { display: none; }
+.dish-meta .link { margin-left: 10px; }
+.item[data-act] { cursor: pointer; }
 .chip {
   border: 1px solid var(--line); background: #fff; color: var(--ink2);
   padding: 6px 12px; border-radius: 999px; font-size: 13px; white-space: nowrap; cursor: pointer;

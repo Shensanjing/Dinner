@@ -22,6 +22,7 @@
   }
   const money = n => '¥' + (Math.round(n * 100) / 100).toFixed(2);
   const yuan = money;
+  const todayStr = () => { const d = new Date(); return iso(new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))); };
 
   /* ---------- 菜品特征 ---------- */
   const PROTEIN = {
@@ -171,12 +172,29 @@
   }
   const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
+  /* 清冰箱：这道菜能把库存里（尤其是快过期的）东西用掉，就加分 */
+  function fridgeScore(state, d, onDate) {
+    if (!state || !state.inventory || !state.inventory.length) return 0;
+    let v = 0;
+    (d.ing || []).forEach(x => {
+      if (x.opt) return;
+      const have = invQty(state, x.key, onDate);
+      if (have <= 0) return;
+      v += Math.min(2, have / Math.max(1, x.g));      // 够用越多越该做
+      const days = invDays(state, x.key, onDate);
+      if (days !== null && days <= 3) v += 2.5;       // 三天内要坏的，优先
+      else if (days !== null && days <= 6) v += 1;
+    });
+    return v;
+  }
+
   function generate(ws, state) {
     const cfg = constraints(state);
     const days = weekDays(ws);
     const used = usedRecently(state, ws, 14);
     const bs = batchesOf(ws);
     const pool = DATA.dishes;
+    const arch = new Set((state && state.archived) || []);
     let best = null, bestScore = -1e9;
 
     for (let attempt = 0; attempt < 180; attempt++) {
@@ -199,6 +217,7 @@
         const wantKind = tpl[i];
 
         const base = d => {
+          if (arch.has(d.id)) return false;                                 // 移进备选库的不再自动排
           if (chosen.has(d.id) || used.has(d.id)) return false;
           if (d.min > limit) return false;
           if (shelfOf(d) < age + 1) return false;
@@ -241,6 +260,7 @@
           if (c.kind === 'onepot') v += 1;
           if (hasLeafy(c) && age <= 1) v += 4;
           if (age >= 3 && shelfOf(c) <= 5) v -= 20;
+          v += fridgeScore(state, c, date);   // 冰箱里快坏的先吃掉
           if (v > bestLocal) { bestLocal = v; pick = c; sc = v; }
         }
         score += sc;
@@ -271,6 +291,68 @@
       g += it.g;
     });
     return g;
+  }
+  /* 这项食材最早哪天到期（当天起算还剩几天），没有记录返回 null */
+  function invDays(state, key, onDate) {
+    const d0 = onDate || todayStr();
+    let best = null;
+    (state.inventory || []).forEach(it => {
+      if (it.key !== key || !it.exp || it.exp < d0) return;
+      const n = dspan(d0, it.exp);
+      if (best === null || n < best) best = n;
+    });
+    return best;
+  }
+  /* 买了东西：进库存。肉类按冷冻天数放，别的按保质期 */
+  function addInv(state, key, grams) {
+    if (!(grams > 0)) return null;
+    const it = ING[key] || {};
+    const days = it.freeze > 0 && FROZEN_CATS.indexOf(it.cat) >= 0
+      ? Math.min(it.freeze, 60) : Math.max(1, it.shelf || 7);
+    const exp = addD(todayStr(), days);
+    state.inventory = state.inventory || [];
+    const same = state.inventory.find(x => x.key === key && x.exp === exp);
+    if (same) same.g = Math.round((same.g + grams) * 10) / 10;
+    else state.inventory.push({ id: 'i' + Math.random().toString(36).slice(2, 9), key, g: Math.round(grams * 10) / 10, exp });
+    return exp;
+  }
+  /* 做了一顿饭：按这顿的用量从库存里扣，先扣快过期的；不够就扣到 0 并记缺口 */
+  function consumeInv(state, needs) {
+    const used = {}, short = {};
+    Object.keys(needs || {}).forEach(key => {
+      let need = needs[key];
+      const items = (state.inventory || []).filter(x => x.key === key)
+        .sort((a, b) => (a.exp || '9999-99-99').localeCompare(b.exp || '9999-99-99'));
+      items.forEach(it => {
+        if (need <= 0) return;
+        const take = Math.min(it.g, need);
+        it.g = Math.round((it.g - take) * 10) / 10;
+        need -= take;
+        used[key] = Math.round(((used[key] || 0) + take) * 10) / 10;
+      });
+      if (need > 0.5) short[key] = Math.round(need);
+    });
+    state.inventory = (state.inventory || []).filter(x => x.g > 0.5);
+    return { used, short };
+  }
+  /* 一顿饭要用多少东西（不含调料和"要用米饭"这种中间品） */
+  function mealNeeds(state, meal) {
+    const out = {};
+    if (!meal) return out;
+    const eaters = (state.profiles || []).length || 1;
+    const scale = Math.max(1, (meal.eaters && meal.eaters.length) || eaters);
+    (meal.dishes || []).forEach(id => {
+      const d = DISH[id]; if (!d) return;
+      (d.ing || []).forEach(x => {
+        if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) return;
+        out[x.key] = (out[x.key] || 0) + x.g * scale;
+      });
+    });
+    if (meal.rice) {
+      const st = stapleOf(state, meal);
+      out[st.key] = (out[st.key] || 0) + meal.rice * st.rawPerBowl;
+    }
+    return out;
   }
 
   /* ---------- 采购清单 ---------- */
@@ -342,12 +424,16 @@
       }
     });
 
-    /* 按时间顺序结算：上一单用不完的、且还放得住的，抵扣下一单 */
+    /* 按时间顺序结算：上一单用不完的、且还放得住的，抵扣下一单。
+       但如果上一单已经"买了"，那些余量已经进库存了，就不能再算一次 carry。 */
     const leftover = {};
+    const isOrdered = d => !!((state.ordered || {})[d]);
+    let prevOrdered = false;
     out.forEach(b => {
       Object.keys(b.needs).forEach(key => {
         const it = ING[key]; if (!it) return;
         const need = b.needs[key];
+        if (prevOrdered) leftover[key] = 0;
         if (it.pantry) {
           const low = (state.pantry || {})[key] === 'low';
           /* 调料永远不进购物车：标了待补就提醒一下，否则算常备 */
@@ -403,6 +489,8 @@
       b.pay = Math.round((b.total + b.ship) * 100) / 100;
       b.opt = Object.keys(b.optSet || {}).map(k => ({ key: k, name: (ING[k] || {}).name || k, g: Math.round(b.optSet[k]) }));
       b.restock = [...new Map(b.restock.map(r => [r.key, r])).values()];
+      b.ordered = isOrdered(b.deliver);
+      prevOrdered = b.ordered;
     });
     return { ws, batches: out.filter(b => b.items.length || b.have.length) };
   }
@@ -436,6 +524,6 @@
     DAY, WEEK_CN, DISH, ING, SUGGEST, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
     invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal,
-    priceFactor, hydrateCustom
+    priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore
   };
 })(typeof window !== 'undefined' ? window : globalThis);
