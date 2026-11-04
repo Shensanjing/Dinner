@@ -160,6 +160,11 @@ input[type=text], input[type=number], input[type=date], select {
   font: inherit; padding: 9px 11px; border-radius: 11px; border: 1px solid var(--line);
   background: #fff; color: var(--ink); width: 100%;
 }
+textarea {
+  font: inherit; font-size: 13px; line-height: 1.55; padding: 9px 11px; border-radius: 11px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink);
+  width: 100%; box-sizing: border-box; resize: vertical;
+}
 label.fld { display: block; font-size: 12px; color: var(--ink2); margin: 10px 0 4px; }
 .toast {
   position: fixed; left: 50%; bottom: 96px; transform: translate(-50%, 10px); z-index: 60;

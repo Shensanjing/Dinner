@@ -121,12 +121,63 @@
       kcalPerBowl: Math.round((it.kcal || 346) * s.rawPerBowl / 100)
     };
   }
+  /* 没设置「这顿几个人吃」时按几份算（默认 1 人，周末可以单独调） */
+  function eatDefault(state) {
+    return Math.max(1, (state && state.settings && state.settings.eatersDefault) || 1);
+  }
   /* 一顿饭的总热量：菜 + 主食 */
   function mealKcal(state, m) {
     const d = DISH[(m.dishes || [])[0]];
-    const eaters = Math.max(1, (m.eaters || []).length || 1);
+    const eaters = Math.max(1, (m.eaters || []).length || eatDefault(state));
     const riceK = m.rice ? stapleOf(state, m).kcalPerBowl * m.rice : 0;
     return Math.round(((d ? d.kcal : 0) + riceK) * eaters);
+  }
+
+  /* 这道菜的主食是面还是米饭：决定这天算"面日"还是"米饭日" */
+  const NOODLE_KEYS = ['noodle', 'flour', 'dough'];
+  function stapleKind(d) {
+    const ks = ((d && d.ing) || []).map(x => x.key);
+    if (ks.some(k => NOODLE_KEYS.indexOf(k) >= 0)) return 'noodle';
+    if (ks.indexOf('rice_cooked') >= 0 || ks.indexOf('brown_rice_cooked') >= 0) return 'rice_dish';
+    return 'plain';
+  }
+  /* 一周主食怎么穿插：2–3 天吃面，不连吃三天面，米饭也不连排三天以上；
+     meatIdx 里的日子已经被荤菜占了，不会排面 */
+  function stapleWeek(meatIdx, want) {
+    const busy = meatIdx || [];
+    const n = want || (Math.random() < 0.45 ? 3 : 2);
+    for (let t = 0; t < 200; t++) {
+      const free = [0, 1, 2, 3, 4, 5, 6].filter(i => busy.indexOf(i) < 0);
+      if (free.length < n) break;
+      const idx = shuffle(free.slice()).slice(0, n).sort((a, b) => a - b);
+      let ok = true;
+      for (let i = 2; i < idx.length; i++) if (idx[i] - idx[i - 2] === 2) ok = false;
+      const runs = []; let run = 0;
+      for (let i = 0; i < 7; i++) {
+        if (idx.indexOf(i) >= 0) { runs.push(run); run = 0; } else run++;
+      }
+      runs.push(run);
+      if (Math.max.apply(null, runs) > 3) ok = false;
+      if (!ok) continue;
+      const s = new Array(7).fill('rice');
+      idx.forEach(i => { s[i] = 'noodle'; });
+      return s;
+    }
+    const s = new Array(7).fill('rice');
+    if (busy.indexOf(2) < 0) s[2] = 'noodle';
+    if (busy.indexOf(5) < 0) s[5] = 'noodle';
+    return s;
+  }
+
+  /* 荤菜放在哪几天：只放工作日，两天不挨着 */
+  function meatDays(nMeat) {
+    const n = Math.max(0, Math.min(5, nMeat | 0));
+    if (!n) return [];
+    for (let t = 0; t < 120; t++) {
+      const pick = shuffle([0, 1, 2, 3, 4]).slice(0, n).sort((a, b) => a - b);
+      if (pick.every((p, i) => i === 0 || p - pick[i - 1] >= 2)) return pick;
+    }
+    return [0, 2, 4].slice(0, n);
   }
 
   function constraints(state) {
@@ -147,25 +198,27 @@
 
   const CAP = { 猪: 2, 牛: 1, 鸡: 1, 虾: 1, 蛋: 2, 豆: 2, 素: 9 };
 
-  /* 一周的"菜品结构"：荤菜顿数由用户定（默认 3），其余是半荤 / 素 / 面饭。
-     荤菜只放工作日、且两天不挨着；周末留给简单的（素、面饭、半荤）。 */
-  function templateFor(nMeat) {
+  /* 一周的"菜品结构"：先把面日定下来（那天必须一锅出），再在剩下的米饭日里排荤菜。
+     荤菜只放工作日、且两天不挨着；周末留给简单的。 */
+  function templateFor(nMeat, staples, meatIdx) {
     const n = Math.max(1, Math.min(5, nMeat | 0));
     const slots = new Array(7).fill('veg');
-    let pos = [];
-    for (let t = 0; t < 80; t++) {
-      const cand = shuffle([0, 1, 2, 3, 4]).slice(0, n).sort((a, b) => a - b);
-      if (cand.every((p, i) => i === 0 || p - cand[i - 1] >= 2)) { pos = cand; break; }
+    staples.forEach((s, i) => { if (s === 'noodle') slots[i] = 'onepot'; });
+
+    const cands = [0, 1, 2, 3, 4].filter(i => slots[i] === 'veg');   // 荤菜只排工作日、且不是面日
+    let pos = (meatIdx || []).filter(i => slots[i] === 'veg').slice(0, n);
+    if (!pos.length) {
+      for (let t = 0; t < 80; t++) {
+        const pick = shuffle(cands.slice()).slice(0, n).sort((a, b) => a - b);
+        if (pick.length === n && pick.every((p, i) => i === 0 || p - pick[i - 1] >= 2)) { pos = pick; break; }
+      }
     }
-    if (!pos.length) pos = [0, 2, 4].slice(0, n);
+    if (!pos.length) pos = cands.filter((x, i) => i % 2 === 0).slice(0, n);
     pos.forEach(i => { slots[i] = 'meat'; });
 
-    const pickFrom = arr => arr.length ? arr.splice(Math.floor(Math.random() * arr.length), 1)[0] : -1;
     const freeOf = () => [0, 1, 2, 3, 4, 5, 6].filter(x => slots[x] === 'veg');
-    let i = pickFrom(freeOf().filter(x => x >= 5));      // 面饭优先放周末
-    if (i < 0) i = pickFrom(freeOf());
-    if (i >= 0) slots[i] = 'onepot';
-    i = pickFrom(freeOf().filter(x => x < 5));           // 半荤优先放工作日
+    const pickFrom = arr => arr.length ? arr.splice(Math.floor(Math.random() * arr.length), 1)[0] : -1;
+    let i = pickFrom(freeOf().filter(x => x < 5));           // 半荤优先放工作日
     if (i < 0) i = pickFrom(freeOf());
     if (i >= 0) slots[i] = 'half';
     return slots;
@@ -195,14 +248,17 @@
     const bs = batchesOf(ws);
     const pool = DATA.dishes;
     const arch = new Set((state && state.archived) || []);
+    const wantN = Math.random() < 0.45 ? 3 : 2;         // 这周吃 2 顿面还是 3 顿面，一次定死
     let best = null, bestScore = -1e9;
 
     for (let attempt = 0; attempt < 180; attempt++) {
-      const tpl = templateFor(cfg.meatPerWeek);
+      const md = meatDays(cfg.meatPerWeek);            // 荤菜占哪几天
+      const sp = stapleWeek(md, wantN);                 // 这周哪几天吃面（不会和荤菜撞）
+      const tpl = templateFor(cfg.meatPerWeek, sp, md);
       const picked = [];
       const chosen = new Set();
       const proteinCount = {};
-      let score = 0, ok = true;
+      let score = 0, ok = true, meatMiss = 0;
 
       for (let i = 0; i < 7; i++) {
         const date = days[i];
@@ -215,6 +271,7 @@
         const prevKind = prev ? prev.kind : null;
         const prevMin = prev ? prev.min : 0;
         const wantKind = tpl[i];
+        const wantStaple = sp[i];
 
         const base = d => {
           if (arch.has(d.id)) return false;                                 // 移进备选库的不再自动排
@@ -228,15 +285,25 @@
           if (prevMin >= 45 && d.min >= 45) return false;               // 不连着两天做硬菜
           return true;
         };
-        let cands = pool.filter(d => d.kind === wantKind && base(d));
+        /* 面日只吃面；米饭日不吃面（盖饭/炒饭自带米饭，算米饭日） */
+        const okStaple = d => wantStaple === 'noodle'
+          ? stapleKind(d) === 'noodle'
+          : stapleKind(d) !== 'noodle';
+        const okKind = d => wantStaple === 'noodle'
+          ? d.kind === 'onepot'
+          : (d.kind === wantKind || (d.kind === 'onepot' && stapleKind(d) === 'rice_dish'));
+        let cands = pool.filter(d => okKind(d) && okStaple(d) && base(d));
         if (!cands.length) {
           /* 这类菜今天一个都排不进去（保质期/撞菜/上限），退一步：优先补还没排满的类别 */
           const quota = {}, used2 = {};
           tpl.forEach(k => { quota[k] = (quota[k] || 0) + 1; });
           picked.forEach(m => { used2[m.kind] = (used2[m.kind] || 0) + 1; });
-          cands = pool.filter(d => base(d) && (used2[d.kind] || 0) < (quota[d.kind] || 0));
+          cands = pool.filter(d => okStaple(d) && base(d) && (used2[d.kind] || 0) < (quota[d.kind] || 0));
         }
-        if (!cands.length) cands = pool.filter(d => base(d));
+        if (!cands.length) cands = pool.filter(d => okStaple(d) && base(d));
+        /* 最后兜底：撞菜/上限/相邻这些都让步，只保证"放得住、来得及、是这类主食"，
+           否则极端情况（比如备选库里移走了很多菜）会整周排空 */
+        if (!cands.length) cands = pool.filter(d => !arch.has(d.id) && d.min <= limit && shelfOf(d) >= age + 1 && okStaple(d));
         if (!cands.length) { ok = false; break; }
 
         let pick = cands[Math.floor(Math.random() * cands.length)], sc = 0, bestLocal = -1e9;
@@ -263,17 +330,19 @@
           v += fridgeScore(state, c, date);   // 冰箱里快坏的先吃掉
           if (v > bestLocal) { bestLocal = v; pick = c; sc = v; }
         }
+        if (wantKind === 'meat' && pick.kind !== 'meat') meatMiss++;   // 荤菜位被别的菜顶了，扣分
         score += sc;
         const p = mainProtein(pick);
         proteinCount[p] = (proteinCount[p] || 0) + 1;
         chosen.add(pick.id);
+        const sk = stapleKind(pick);
         picked.push({
           date, dishes: [pick.id], protein: p, kind: pick.kind, min: pick.min,
           status: 'cook', locked: false, staple: cfg.staple,
-          rice: pick.kind === 'onepot' ? 0 : cfg.riceDefault, age
+          rice: (sk === 'noodle' || sk === 'rice_dish') ? 0 : cfg.riceDefault, age
         });
       }
-      if (ok && score > bestScore) { bestScore = score; best = picked; }
+      if (ok && score - 50 * meatMiss > bestScore) { bestScore = score - 50 * meatMiss; best = picked; }
     }
 
     if (!best) {
@@ -402,7 +471,7 @@
         b.covers.push({ date: dt0, name: m.dishes.map(id => (DISH[id] || {}).name).filter(Boolean).join(' + '), week: pw === ws ? 'this' : 'adj' });
         m.dishes.forEach(id => {
           const d = DISH[id]; if (!d) return;
-          const scale = Math.max(1, (m.eaters && m.eaters.length) || eaters);
+          const scale = Math.max(1, (m.eaters && m.eaters.length) || eatDefault(state));
           d.ing.forEach(x => {
             if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water') return;
             const grams = x.g * scale;
@@ -492,6 +561,47 @@
       b.ordered = isOrdered(b.deliver);
       prevOrdered = b.ordered;
     });
+
+    /* 提前买：后面的单里"放得住"的东西，挪到前面这单来，好凑满 ¥39 起送。
+       只是把下单时机提前，总花销不变；放不到那天的（叶菜、鲜鱼、豆腐）不挪。 */
+    const canEarly = (key, gap) => {
+      const it = ING[key]; if (!it) return false;
+      const keep = keepDays(key);
+      if (keep < gap + 2) return false;
+      if (FROZEN_CATS.indexOf(it.cat) >= 0) return true;         // 肉可以买回来就冻
+      return ['蔬菜', '主食', '菌菇', '水果', '干货'].indexOf(it.cat) >= 0 && keep >= 7;
+    };
+    const retotal = b => {
+      b.total = Math.round(b.items.reduce((a, x) => a + x.unit * x.packs, 0) * 100) / 100;
+      b.factor = priceFactor(state);
+      b.rawTotal = Math.round(b.total / b.factor * 100) / 100;
+      b.ship = b.total > 0 && b.total < 39 ? 3 : 0;
+      b.gap = b.total > 0 ? Math.round((39 - b.total) * 100) / 100 : 0;
+      b.pay = Math.round((b.total + b.ship) * 100) / 100;
+    };
+    for (let i = 0; i < out.length - 1; i++) {
+      const b = out[i];
+      if (!b.items.length || b.total >= 39 || b.ordered) continue;
+      for (let j = i + 1; j < out.length && b.total < 39; j++) {
+        const nb = out[j];
+        if (!nb.items.length) continue;
+        const gap = Math.max(1, dspan(b.deliver, nb.deliver));
+        const move = nb.items.filter(x => canEarly(x.key, gap));
+        if (!move.length) continue;
+        const moved = [];
+        move.forEach(x => {
+          if (b.total >= 39) return;
+          b.items.push(Object.assign({}, x, { early: nb.name, earlyDate: nb.deliver }));
+          b.total += x.unit * x.packs;
+          moved.push(x);
+        });
+        if (!moved.length) continue;
+        nb.items = nb.items.filter(x => moved.indexOf(x) < 0);
+        retotal(nb);
+      }
+      retotal(b);
+      b.earlyCount = b.items.filter(x => x.early).length;
+    }
     return { ws, batches: out.filter(b => b.items.length || b.have.length) };
   }
 
@@ -517,13 +627,13 @@
   const SUGGEST = ((root.DATA && root.DATA.suggest) || []).slice();
   /* 用户"加进我的菜谱"的菜（含从推荐里收的）：启动时并回 DISH，排期和采购就都认了 */
   function hydrateCustom(state) {
-    ((state && state.custom) || []).forEach(d => { if (d && d.id && !DISH[d.id]) DISH[d.id] = d; });
+    ((state && state.custom) || []).forEach(d => { if (d && d.id) DISH[d.id] = d; });   // 自己的改动覆盖原始菜谱
   }
 
   root.Core = {
     DAY, WEEK_CN, DISH, ING, SUGGEST, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
-    invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal,
+    invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal, stapleKind, stapleWeek,
     priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore
   };
 })(typeof window !== 'undefined' ? window : globalThis);

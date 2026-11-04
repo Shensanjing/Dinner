@@ -27,7 +27,7 @@
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
       weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
-      meatPerWeek: 3, staple: 'brown'
+      meatPerWeek: 3, staple: 'brown', eatersDefault: 1
     },
     skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {}
   });
@@ -50,6 +50,8 @@
     S.v = 3;
   }
   C.hydrateCustom(S);   // 用户自己收进菜谱的菜要能被排期和采购认出来
+  /* 日程页以"今天"为顶，每次打开都重新对齐到本周一，跨周不用手动翻 */
+  S.weekStart = C.mondayOf(today());
   /* 库存记录补唯一 id：以前按下标删，列表按到期日排序后会删错行 */
   S.archived = S.archived || [];
   (S.inventory || []).forEach(x => { if (!x.id) x.id = uid(); });
@@ -77,12 +79,11 @@
     const wk = `${ws.slice(5).replace('-', '.')} – ${we.slice(5).replace('-', '.')}`;
     let s = (S.tab === 'week' || S.tab === 'shop') ? wk : '';
     if (S.tab === 'week') {
-      const p = plan(ws);
-      if (p) {
-        const n = p.days.filter(m => m.status === 'cook' && m.dishes.length).length;
-        const out = p.days.filter(m => m.status === 'out').length;
-        s += ` · 已排 ${n} 顿` + (out ? `，外食 ${out} 顿` : '');
-      } else s += ' · 还没有排';
+      const m = mealForDate(today());
+      const d = m && m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
+      s = d ? `今天吃 ${d.name}${m.status === 'out' ? '（外食）' : ''}` : (m && m.status === 'out' ? '今天外食' : '今天还没定');
+      const n = (S.plans[ws] || { days: [] }).days.filter(x => x.status === 'cook' && x.dishes.length).length;
+      s += ` · 这周已排 ${n} 顿`;
     }
     if (S.tab === 'shop') {
       const sh = C.shopping(ws, S);
@@ -92,7 +93,7 @@
     if (S.tab === 'lib') s = `${Object.keys(DISH).length} 道家常菜`;
     if (S.tab === 'inv') s = S.inventory.length ? `${S.inventory.length} 样在库` : '还没有记录';
     $('#subtitle').textContent = s;
-    const nav = S.tab === 'week' || S.tab === 'shop';
+    const nav = S.tab === 'shop';                       // 日程页是连续滚动，不再左右翻页
     $('#btnPrev').style.display = $('#btnNext').style.display = nav ? '' : 'none';
     document.querySelectorAll('#tabbar button').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
   }
@@ -122,6 +123,8 @@
       meta.push(`${d.min} 分钟`);
       meta.push(KIND[d.kind]);
       if (m.rice) meta.push(`${st.name} ${m.rice} 碗`);
+      const nEat = (m.eaters && m.eaters.length) || S.settings.eatersDefault || 1;
+      if (nEat > 1) meta.push(`${nEat} 人`);
       if (d.spice >= 2) meta.push('辣');
       inner = `<div class="dish-line"><span class="dish-name">${esc(d.name)}</span>
           ${d.spice >= 2 ? '<span class="badge spicy">辣</span>' : ''}
@@ -132,32 +135,75 @@
         <span class="day-name">${C.WEEK_CN[C.dow(m.date)]}</span>
         <span class="day-date">${mo}.${da}</span>
         ${isToday ? '<span class="badge">今天</span>' : ''}
-        <span class="sp"></span>${m.done ? '<span class="badge ok">✓ 已做</span>' : ''}${freshBadge(m)}${m.locked ? '<span class="badge">🔒 锁定</span>' : ''}
-      </div>${inner}</div>`;
+        <span class="sp"></span>${m.done ? '<span class="badge ok">✓ 已做</span>' : ''}${freshBadge(m)}${m.locked ? '<span class="badge">🔒 锁定</span>' : ''}      </div>${inner}</div>`;
   }
-  function viewWeek() {
-    const p = plan(S.weekStart);
-    if (!p) {
-      $('#view').innerHTML = `
-        <div class="card" style="text-align:center;padding:22px 16px">
-          <div style="font-size:15px;margin-bottom:6px">这一周还没排菜</div>
-          <div class="muted" style="margin-bottom:14px">按保质期和两次到货时间自动排 7 顿晚饭</div>
-          <button class="btn primary block" data-act="regen">一键排这周</button>
-        </div>
-        <div class="sec-title">也可以一顿一顿自己点</div>
-        ${[0, 1, 2, 3, 4, 5, 6].map(i => mealCard({ date: C.addD(S.weekStart, i), status: 'empty', dishes: [] })).join('')}`;
-      return;
+  /* 任意一天的那顿（跨周自动找） */
+  function mealForDate(date) {
+    const p = plan(C.mondayOf(date));
+    return p ? p.days.find(m => m.date === date) || null : null;
+  }
+  /* 往后补排：缺哪周就排哪周，已锁定的不动 */
+  function ensureAhead(weeks) {
+    let changed = false;
+    for (let i = 0; i <= weeks; i++) {
+      const ws = C.mondayOf(C.addD(S.weekStart, i * 7));
+      if (!S.plans[ws]) { S.plans[ws] = C.generate(ws, S); changed = true; }
     }
-    const cook = p.days.filter(m => m.status === 'cook' && m.dishes.length);
-    const kcal = cook.reduce((a, m) => a + C.mealKcal(S, m), 0);
+    if (changed) save();
+  }
+  /* 过去 N 天：吃了什么、多少能量、花了多少钱 */
+  function pastStats(n) {
+    const out = { days: [], kcal: 0, done: 0, spend: 0, shopN: 0 };
+    for (let i = n; i >= 1; i--) {
+      const date = C.addD(today(), -i);
+      const m = mealForDate(date);
+      const d = m && m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
+      if (!d && !(m && m.status === 'out')) continue;
+      out.days.push({ date, name: d ? d.name : '外食', kcal: m ? C.mealKcal(S, m) : 0, done: !!(m && m.done), out: m && m.status === 'out' });
+      if (d) out.kcal += C.mealKcal(S, m);
+      if (m && m.done) out.done++;
+    }
+    Object.keys(S.ordered || {}).forEach(k => {
+      const gap = C.dspan(k, today());
+      if (gap > 0 && gap <= n + 6) { out.spend += (S.ordered[k].total || 0); out.shopN++; }
+    });
+    return out;
+  }
+  let histOpen = false;
+  function viewWeek() {
+    ensureAhead(1);                       // 今天这周 + 下一周，滚动就是连续的
+    const days = [];
+    for (let i = 0; i < 14; i++) days.push(C.addD(today(), i));
+    const hist = pastStats(14);
+    const cook = days.map(d => mealForDate(d)).filter(m => m && m.status === 'cook' && m.dishes.length);
     const cost = cook.reduce((a, m) => { const d = DISH[m.dishes[0]]; return a + (d ? C.dishCost(d) : 0); }, 0);
-    $('#view').innerHTML = `
+    const histCard = (hist.days.length || hist.spend) ? `
+      <div class="card" style="padding:11px 14px" data-act="hist">
+        <div class="row"><span class="muted">过去 14 天 · ${hist.days.length} 顿 · ${hist.kcal} kcal${hist.spend ? ` · 买菜 ${C.yuan(hist.spend)}` : ''}</span>
+        <span class="sp"></span><span class="muted">${histOpen ? '收起' : '查看'}</span></div>
+        ${histOpen ? `<div style="margin-top:6px">${hist.days.map(x => `<div class="row" style="padding:3px 0">
+            <span class="muted" style="width:56px">${C.md(x.date)}</span>
+            <span style="flex:1">${esc(x.name)}${x.done ? ' <span class="badge ok">✓</span>' : ''}</span>
+            <span class="muted">${x.kcal} kcal</span></div>`).join('')}
+          ${hist.spend ? `<div class="muted" style="margin-top:6px">这 ${hist.shopN} 次买菜共 ${C.yuan(hist.spend)}（实付）</div>` : ''}</div>` : ''}
+      </div>` : '';
+    let html = histCard + `
       <div class="card" style="padding:11px 14px">
-        <div class="row"><span class="muted">本周 ${cook.length} 顿 · 食材约 ${C.yuan(cost)} · 人均 ${Math.round(kcal / Math.max(1, cook.length))} kcal/顿</span>
+        <div class="row"><span class="muted">往后 14 天 · ${cook.length} 顿 · 食材约 ${C.yuan(cost)}</span>
         <span class="sp"></span><button class="btn" style="padding:6px 11px;font-size:13px" data-act="regen">重排</button></div>
-      </div>
-      ${p.days.map(mealCard).join('')}
-      <div class="muted center" style="margin:14px 0 4px">点任意一天可换菜 / 外食 / 锁定</div>`;
+      </div>`;
+    let lastWeek = '';
+    days.forEach(date => {
+      const ws = C.mondayOf(date);
+      if (ws !== lastWeek) {
+        html += `<div class="sec-title">${C.md(ws)} 那一周</div>`;
+        lastWeek = ws;
+      }
+      const m = mealForDate(date) || { date, status: 'empty', dishes: [], rice: 0 };
+      html += mealCard(m);
+    });
+    html += `<div class="muted center" style="margin:14px 0 6px">点任意一天可换菜 / 外食 / 改人数 / 锁定</div>`;
+    $('#view').innerHTML = html;
   }
 
   /* ---------------- 采购 ---------------- */
@@ -178,11 +224,12 @@
       const on = checked[x.key];
       const pack = x.rest >= x.specG * 0.45
         ? `<span class="badge warn">整包 ${x.specG}g · 剩 ${x.rest}g</span>` : '';
+      const early = x.early ? `<span class="badge ok">提前到这一单</span>` : '';
       return `<div class="item ${on ? 'done' : ''}" data-act="chk" data-arg="${bi}:${x.key}">
         <div class="cb ${on ? 'on' : ''}">✓</div>
         <div style="flex:1;min-width:0">
-          <div class="nm">${esc(x.name)} ×${x.packs} ${pack}</div>
-          <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}</div>
+          <div class="nm">${esc(x.name)} ×${x.packs} ${pack}${early}</div>
+          <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}${x.early ? ` · 本来在「${esc(x.early)}」` : ''}</div>
         </div>
         <div class="pr">${C.yuan(x.unit * x.packs)}</div></div>`;
     }).join('');
@@ -207,6 +254,7 @@
           : '金额按七鲜标价估算'} · <span class="link" data-act="paid" data-arg="${bi}">回填实付</span></div>
         <div class="covers">这一单吃 ${b.covers.length} 顿：${b.covers.map(c =>
           `<span class="${c.week === 'adj' ? 'adj' : ''}">${C.WEEK_CN[C.dow(c.date)]} ${C.md(c.date)}</span>`).join(' · ')}</div>
+        ${b.earlyCount ? `<div class="muted" style="margin-top:4px">其中 ${b.earlyCount} 样是从后面几单<b>提前买</b>的（放得住），这样才凑得满 ¥39。</div>` : ''}
       </div>` : `
       <div class="card sum-card">
         <div style="font-size:15px;font-weight:600;margin-bottom:4px">这一单不用下单</div>
@@ -246,17 +294,28 @@
   }
 
   /* ---------------- 菜库 ---------------- */
-  let libQ = '', libKind = '', libTab = 'mine';
+  let libQ = '', libKind = '', libTab = 'mine', newSeed = 1;
   const customIds = () => new Set((S.custom || []).map(d => d.id));
   const archIds = () => new Set(S.archived || []);
   const dishById = id => DISH[id] || (C.SUGGEST || []).find(x => x.id === id);
   /* 我的菜谱：原始 53 道去掉移出的，再加上自己收编的 */
   const isMine = d => (!d.src || d.src !== 'suggest' || customIds().has(d.id)) && !archIds().has(d.id);
+  /* 推荐菜按种子打乱，「换一批」就是换种子 */
+  function shuffledFresh(list, seed) {
+    const a = list.slice();
+    let x = (seed * 9301 + 49297) % 233280;
+    for (let i = a.length - 1; i > 0; i--) {
+      x = (x * 9301 + 49297) % 233280;
+      const j = Math.floor(x / 233280 * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
   function viewLib() {
     const all = Object.values(DISH);
     const mine = all.filter(isMine);
     const arch = (S.archived || []).map(dishById).filter(Boolean);
-    const fresh = (C.SUGGEST || []).filter(d => !customIds().has(d.id) && !archIds().has(d.id));
+    const fresh = shuffledFresh((C.SUGGEST || []).filter(d => !customIds().has(d.id) && !archIds().has(d.id)), newSeed);
     const base = libTab === 'new' ? fresh : (libTab === 'arch' ? arch : mine);
     const list = base.filter(d =>
       (!libKind || d.kind === libKind) &&
@@ -271,6 +330,7 @@
         <button class="chip ${libTab === 'new' ? 'on' : ''}" data-act="libtab" data-arg="new">新菜推荐 ${fresh.length}</button>
       </div>
       <input type="text" id="libq" placeholder="搜菜名或食材，比如：茄子" value="${esc(libQ)}">
+      ${libTab === 'new' ? `<button class="btn ghost" style="margin-top:8px" data-act="newfresh">换个花样 · 换一批</button>` : ''}
       <div class="chips" style="margin-top:10px">
         ${['', 'meat', 'half', 'veg', 'onepot'].map(k =>
           `<button class="chip ${libKind === k ? 'on' : ''}" data-act="libkind" data-arg="${k}">${k ? KIND[k] : '全部'}</button>`).join('')}
@@ -352,6 +412,11 @@
           ${Object.keys(C.STAPLE).map(k => `<button class="chip ${s.staple === k ? 'on' : ''}" data-act="setstaple" data-arg="${k}">${C.STAPLE[k].name}</button>`).join('')}
         </div>
         <div class="muted" style="margin-bottom:10px">单顿可以在当天抽屉里临时换。</div>
+        <label class="fld">默认几个人吃</label>
+        <div class="chips" style="margin:0 0 2px">
+          ${[1, 2, 3, 4].map(n => `<button class="chip ${(s.eatersDefault || 1) === n ? 'on' : ''}" data-act="seteaters" data-arg="${n}">${n} 人</button>`).join('')}
+        </div>
+        <div class="muted" style="margin-bottom:10px">影响用量和热量；某天来客人，在当天抽屉里单独调就行。</div>
         <label class="fld">工作日最多做多久（分钟）</label>
         <input type="number" value="${s.weekdayMax}" data-act="setnum" data-arg="weekdayMax">
         <label class="fld">周末最多做多久（分钟）</label>
@@ -399,6 +464,8 @@
   }
   function render() {
     ensureInvIds();
+    S.weekStart = C.mondayOf(today());   // 日程按"今天"对齐，跨周自动接上
+    if (S.tab === 'week' || S.tab === 'shop') ensureAhead(1);
     renderTop();
     ({ week: viewWeek, shop: viewShop, lib: viewLib, inv: viewInv, set: viewSet }[S.tab] || viewWeek)();
     syncHash();
@@ -415,7 +482,7 @@
   $('#backdrop').onclick = hideSheet;
 
   function sheetMeal(date) {
-    const m = mealAt(S.weekStart, date) || { date, status: 'empty', dishes: [], rice: 0 };
+    const m = mealForDate(date) || { date, status: 'empty', dishes: [], rice: 0 };
     const d = m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
     const st = C.stapleOf(S, m);
     const [y, mo, da] = date.split('-');
@@ -429,8 +496,9 @@
       <div class="act-list">
         <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '换一道' : '选一道菜'}</button>
         <button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>
-        <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : '今天出去吃'}</button>
+        <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : (date === today() ? '今天出去吃' : '这天出去吃')}</button>
         <button class="act" data-act="lock" data-arg="${date}"><span class="em">🔒</span>${m.locked ? '解锁这顿' : '锁定这顿（重排时不动）'}</button>
+        <button class="act" data-act="eaters" data-arg="${date}"><span class="em">👥</span>这顿 ${(m.eaters && m.eaters.length) || S.settings.eatersDefault || 1} 人吃（点一下改）</button>
         <button class="act" data-act="rice" data-arg="${date}"><span class="em">🍚</span>${st.name}：${m.rice || 0} 碗${m.rice ? `（生米 ${Math.round(m.rice * st.rawPerBowl)}g）` : ''}</button>
         <button class="act" data-act="staple" data-arg="${date}"><span class="em">🌾</span>这顿换成${st.id === 'brown' ? '白米饭' : '糙米饭'}</button>
         <button class="act danger" data-act="clear" data-arg="${date}"><span class="em">🗑</span>清空这顿</button>
@@ -465,14 +533,76 @@
       <ol class="steps">${d.steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol>
       ${d.src === 'suggest' && !customIds().has(d.id) ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="addcustom" data-arg="${d.id}">加进我的菜谱</button></div>` : ''}
       ${archIds().has(d.id) ? `<div class="row" style="margin-top:14px"><button class="btn primary block" data-act="restore" data-arg="${d.id}">加回菜谱</button></div>` : ''}
-      <div class="row" style="margin-top:14px"><button class="btn block" data-act="close">关闭</button></div>`);
+      <div class="row" style="margin-top:14px"><button class="btn ghost block" data-act="editdish" data-arg="${d.id}">✏️ 改这道菜（食材 / 调料 / 做法）</button></div>
+      <div class="row" style="margin-top:8px"><button class="btn block" data-act="close">关闭</button></div>`);
+  }
+
+  /* 编辑菜谱：三块文本，改完解析回结构 */
+  function linesOf(arr, fmt) { return arr.map(fmt).join('\n'); }
+  /* 食材名 → key；菜谱里没有的就新建一个自定义食材 */
+  function keyOfName(name) {
+    const hit = Object.values(C.ING).find(i => i.name === name);
+    if (hit) return hit.key;
+    const key = 'xc' + Math.random().toString(36).slice(2, 8);
+    const obj = { key, name, cat: '其他', shelf: 7, freeze: 0, unit: null, per: null, sku: null, pantry: false, kcal: 0, custom: true };
+    S.customIng = S.customIng || []; S.customIng.push(obj); C.ING[key] = obj;
+    return key;
+  }
+  const SEASON_G = { '勺': 12, '茶匙': 5, '碗': 150, '朵': 4, '片': 3, '根': 1.5, '段': 1.5, '块': 10, '个': 50, '颗': 5, 'g': 1, 'ml': 1 };
+  function parseRows(txt, isSeason) {
+    const out = [];
+    (txt || '').split('\n').forEach(line => {
+      const s = line.trim(); if (!s) return;
+      const opt = /可选/.test(s);
+      const clean = s.replace(/[（(]\s*可选\s*[)）]/g, ' ').replace(/\s+/g, ' ').trim();
+      const m = clean.match(/^(.+?)\s+([\d.]+)\s*(\S*)$/);
+      if (!m) { out.push({ bad: s }); return; }
+      const name = m[1].trim();
+      const num1 = +m[2] || 0;
+      const unit = m[3] || 'g';
+      const key = keyOfName(name);
+      if (isSeason) {
+        const per = SEASON_G[unit] == null ? (unit === 'g' || unit === 'ml' ? 1 : 5) : SEASON_G[unit];
+        out.push({ key, name, qty: num1, unit, g: Math.round(num1 * per * 10) / 10 });
+      } else {
+        /* 第一个数字是克数；后面若还跟了“1.5根”这种，就同时记下个数 */
+        let qty = 0, u = 'g';
+        const um = String(m[3] || '').match(/^([\d.]+)\s*(\S*)$/);
+        if (um) { qty = +um[1] || 0; u = um[2] || 'g'; }
+        out.push({ key, name, g: num1, qty, unit: u, opt });
+      }
+    });
+    return out;
+  }
+  function sheetEditDish(id) {
+    const d = dishById(id); if (!d) return;
+    const ingTxt = linesOf(d.ing, x => `${x.name} ${Math.round(x.g * 10) / 10}${x.unit && x.unit !== 'g' ? ' ' + (x.qty || '') + x.unit : ''}`);
+    const seaTxt = linesOf(d.season, x => `${x.name} ${x.qty ? unitTxt(x.qty) + (x.unit || '') : num(x.g) + 'g'}`);
+    const stpTxt = linesOf(d.steps, s => s);
+    showSheet(`
+      <h2>改菜谱</h2>
+      <div class="sheet-sub">${esc(d.name)} · 一行一样，改完点保存</div>
+      <div class="muted" style="margin:10px 2px 4px">名称 / 分钟 / 每份热量</div>
+      <div class="row" style="gap:8px">
+        <input type="text" id="ed-name" value="${esc(d.name)}" style="flex:2">
+        <input type="number" id="ed-min" value="${d.min}" style="flex:1">
+        <input type="number" id="ed-kcal" value="${d.kcal}" style="flex:1">
+      </div>
+      <div class="muted" style="margin:12px 2px 4px">食材（名称 + 克数，可加“ 3瓣”这种个数写法）</div>
+      <textarea id="ed-ing" rows="6">${esc(ingTxt)}</textarea>
+      <div class="muted" style="margin:12px 2px 4px">调料（名称 + 数量/单位）</div>
+      <textarea id="ed-sea" rows="4">${esc(seaTxt)}</textarea>
+      <div class="muted" style="margin:12px 2px 4px">做法（一行一步）</div>
+      <textarea id="ed-stp" rows="7">${esc(stpTxt)}</textarea>
+      <div class="row" style="margin-top:14px;gap:8px">
+        <button class="btn primary block" data-act="savedish" data-arg="${d.id}">保存</button>
+      </div>
+      <div class="row" style="margin-top:8px"><button class="btn ghost block" data-act="dish" data-arg="${d.id}">取消</button></div>`);
   }
 
   let pickQ = '', pickKind = '';
   function sheetPicker(date) {
-    const cur = mealAt(S.weekStart, date);
-    const used = new Set();
-    (plan(S.weekStart) || { days: [] }).days.forEach(m => { if (m.date !== date) (m.dishes || []).forEach(x => used.add(x)); });
+    const cur = mealForDate(date);
     const list = Object.values(DISH).filter(d => !archIds().has(d.id)).filter(d =>
       (!pickKind || d.kind === pickKind) &&
       (!pickQ || d.name.includes(pickQ) || d.ing.some(i => i.name.includes(pickQ))));
@@ -481,7 +611,7 @@
       const age = C.dspan(b.deliver, date);
       const risky = C.shelfOf(d) < age + 1;
       return `<div class="pick-item" data-act="pick" data-arg="${date}|${d.id}">
-        <div style="flex:1"><div class="nm">${esc(d.name)} ${used.has(d.id) ? '<span class="muted">·本周已用</span>' : ''}</div>
+        <div style="flex:1"><div class="nm">${esc(d.name)}</div>
         <div class="mt">${KIND[d.kind]} · ${d.min}分 · ${d.kcal}kcal${risky ? ' · <span style="color:#b7791f">保质期可能不够</span>' : ''}</div></div>
         <span class="muted">${C.yuan(C.dishCost(d))}</span></div>`;
     }).join('');
@@ -569,36 +699,42 @@
   }
 
   function setMeal(date, patch) {
-    const p = S.plans[S.weekStart] || (S.plans[S.weekStart] = { weekStart: S.weekStart, days: [] });
+    const ws = C.mondayOf(date);                       // 按这一天所在的那一周存，跨周也对
+    const p = S.plans[ws] || (S.plans[ws] = { weekStart: ws, days: [] });
     let m = p.days.find(x => x.date === date);
     if (!m) { m = { date, dishes: [], status: 'empty', locked: false, rice: 0 }; p.days.push(m); p.days.sort((a, b) => a.date.localeCompare(b.date)); }
     Object.assign(m, patch);
     if (m.dishes && m.dishes.length) {
       const d = DISH[m.dishes[0]];
       m.kind = d.kind; m.min = d.min; m.protein = C.mainProtein(d);
-      m.age = C.dspan(C.batchesOf(S.weekStart)[C.batchIndexOf(S.weekStart, date)].deliver, date);
+      m.age = C.dspan(C.batchesOf(ws)[C.batchIndexOf(ws, date)].deliver, date);
     }
     save(); render();
   }
 
   function regenerate() {
-    const old = plan(S.weekStart);
-    const locked = old ? old.days.filter(m => m.locked && m.dishes.length) : [];
-    const np = C.generate(S.weekStart, S);
-    const usedByLocked = new Set(locked.map(m => m.dishes[0]));
-    locked.forEach(lm => {
-      const slot = np.days.find(x => x.date === lm.date);
-      if (slot) { Object.assign(slot, lm); }
+    const weeks = [];
+    for (let i = 0; i <= 1; i++) weeks.push(C.mondayOf(C.addD(S.weekStart, i * 7)));
+    weeks.forEach(ws => {
+      const old = plan(ws);
+      const locked = old ? old.days.filter(m => m.locked && m.dishes.length) : [];
+      const np = C.generate(ws, S);
+      const usedByLocked = new Set(locked.map(m => m.dishes[0]));
+      locked.forEach(lm => {
+        const slot = np.days.find(x => x.date === lm.date);
+        if (slot) { Object.assign(slot, lm); }
+      });
+      np.days.forEach(m => {
+        if (locked.some(l => l.date === m.date)) return;
+        if (usedByLocked.has(m.dishes[0])) {
+          const alt = Object.values(DISH).filter(d => !usedByLocked.has(d.id) && d.min <= (C.dow(m.date) % 6 === 0 ? S.settings.weekendMax : S.settings.weekdayMax));
+          if (alt.length) { m.dishes = [alt[Math.floor(Math.random() * alt.length)].id]; const d = DISH[m.dishes[0]]; m.protein = C.mainProtein(d); m.rice = riceFor(d.kind); }
+        }
+      });
+      S.plans[ws] = np;
     });
-    np.days.forEach(m => {
-      if (locked.some(l => l.date === m.date)) return;
-      if (usedByLocked.has(m.dishes[0])) {
-        const alt = Object.values(DISH).filter(d => !usedByLocked.has(d.id) && d.min <= (C.dow(m.date) % 6 === 0 ? S.settings.weekendMax : S.settings.weekdayMax));
-        if (alt.length) { m.dishes = [alt[Math.floor(Math.random() * alt.length)].id]; const d = DISH[m.dishes[0]]; m.protein = C.mainProtein(d); m.rice = riceFor(d.kind); }
-      }
-    });
-    S.plans[S.weekStart] = np; save(); render();
-    toast('已排好 7 顿');
+    save(); render();
+    toast('往后两周都排好了');
   }
 
   const ACT = {
@@ -608,11 +744,11 @@
     picker: d => sheetPicker(d),
     pickkind: k => { pickKind = k; sheetPicker(CURRENT_PICK); },
     pick: a => { const [date, id] = a.split('|'); const d = DISH[id]; setMeal(date, { dishes: [id], status: 'cook', rice: riceFor(d.kind) }); hideSheet(); toast('已换成 ' + d.name); },
-    out: d => { const m = mealAt(S.weekStart, d); setMeal(d, { status: m && m.status === 'out' ? 'cook' : 'out' }); hideSheet(); toast(m && m.status === 'out' ? '改回在家吃' : '这顿外食，食材留到下一顿'); },
-    lock: d => { const m = mealAt(S.weekStart, d); setMeal(d, { locked: !(m && m.locked) }); hideSheet(); },
-    rice: d => { const m = mealAt(S.weekStart, d); setMeal(d, { rice: ((m && m.rice) || 0) + 1 > 4 ? 0 : ((m && m.rice) || 0) + 1 }); sheetMeal(d); },
+    out: d => { const m = mealForDate(d); setMeal(d, { status: m && m.status === 'out' ? 'cook' : 'out' }); hideSheet(); toast(m && m.status === 'out' ? '改回在家吃' : '这顿外食，食材留到下一顿'); },
+    lock: d => { const m = mealForDate(d); setMeal(d, { locked: !(m && m.locked) }); hideSheet(); },
+    rice: d => { const m = mealForDate(d); setMeal(d, { rice: ((m && m.rice) || 0) + 1 > 4 ? 0 : ((m && m.rice) || 0) + 1 }); sheetMeal(d); },
     staple: d => {
-      const m = mealAt(S.weekStart, d);
+      const m = mealForDate(d);
       const cur = C.stapleOf(S, m).id;
       setMeal(d, { staple: cur === 'brown' ? 'white' : 'brown' });
       sheetMeal(d);
@@ -624,6 +760,46 @@
     chk: a => { const [bi, key] = a.split(':'); const k = S.weekStart + ':' + bi; S.checked[k] = S.checked[k] || {}; S.checked[k][key] = !S.checked[k][key]; save(); viewShop(); },
     libkind: k => { libKind = k; viewLib(); },
     libtab: k => { libTab = k; viewLib(); },
+    newfresh: () => { newSeed = (newSeed + 1) % 9973; libQ = ''; viewLib(); toast('换了一批'); },
+    hist: () => { histOpen = !histOpen; viewWeek(); },
+    eaters: d => {
+      const m = mealForDate(d) || mealAt(C.mondayOf(d), d);
+      if (!m) return;
+      const ps = S.profiles || [{ id: 'p1' }];
+      const cur = (m.eaters && m.eaters.length) || S.settings.eatersDefault || 1;
+      const next = cur >= ps.length ? 1 : cur + 1;
+      m.eaters = ps.slice(0, next).map(p => p.id);
+      save(); sheetMeal(d);
+      toast(next === 1 ? '这顿按 1 人份算' : `这顿按 ${next} 人份算`);
+    },
+    editdish: id => sheetEditDish(id),
+    savedish: id => {
+      const d = dishById(id); if (!d) return;
+      const name = ($('#ed-name').value || '').trim() || d.name;
+      const mins = +$('#ed-min').value || d.min;
+      const rows = parseRows($('#ed-ing').value, false);
+      const bad = rows.filter(x => x.bad);
+      const ing = rows.filter(x => !x.bad);
+      if (bad.length) return toast('食材这行看不懂：' + bad[0].bad);
+      if (!ing.length) return toast('食材不能是空的');
+      const sea = parseRows($('#ed-sea').value, true).filter(x => !x.bad);
+      const steps = ($('#ed-stp').value || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const kcal = Math.round(ing.reduce((a, x) => {
+        const it = C.ING[x.key];
+        return a + (it && it.kcal ? x.g / 100 * it.kcal : 0);
+      }, 0));
+      const nd = Object.assign({}, d, {
+        name, min: mins, ing, season: sea, steps,
+        kcal: kcal > 0 ? kcal : d.kcal,
+        src: d.src || 'custom'
+      });
+      S.custom = (S.custom || []).filter(x => x.id !== id);
+      S.custom.push(nd);
+      C.hydrateCustom(S);
+      save();
+      sheetDish(id, 1);
+      toast('已保存，采购和热量都跟着更新了');
+    },
     addcustom: id => {
       const d = (C.SUGGEST || []).find(x => x.id === id);
       if (!d || customIds().has(id)) return;
@@ -661,7 +837,7 @@
       toast(`已记进库存：${added.length} 样`);
     },
     done: d => {
-      const m = mealAt(S.weekStart, d);
+      const m = mealForDate(d);
       if (!m || !(m.dishes || []).length) return toast('这顿还没排菜');
       if (m.done) {                          // 撤销：把扣掉的加回去
         const back = m.deducted || {};
@@ -692,6 +868,7 @@
     setrice: v => { S.settings.riceGrams = Math.max(30, Math.min(500, +v || 130)); save(); viewSet(); },
     setmeat: n => { S.settings.meatPerWeek = +n; save(); viewSet(); },
     setstaple: k => { S.settings.staple = k; save(); viewSet(); },
+    seteaters: n => { S.settings.eatersDefault = +n; save(); viewSet(); },
     goto: t => { S.tab = t; save(); render(); },
     addprofile: () => { S.profiles.push({ id: 'p' + Date.now(), name: '家人', portion: 1 }); save(); viewSet(); },
     addinv: () => sheetAddInv(),
@@ -809,6 +986,7 @@
     const ui = qs.get('ui');
     if (ui) {
       if (ui.startsWith('dish:')) sheetDish(ui.slice(5), 1);
+      else if (ui.startsWith('edit:')) sheetEditDish(ui.slice(5));
       else if (ui.startsWith('lib:')) { S.tab = 'lib'; libTab = ui.slice(4) || 'mine'; render(); }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
