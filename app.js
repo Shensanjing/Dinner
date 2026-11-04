@@ -35,6 +35,17 @@
   try { S = JSON.parse(localStorage.getItem(LS)) || DEF(); } catch (e) { S = DEF(); }
   Object.keys(DEF()).forEach(k => { if (S[k] === undefined) S[k] = DEF()[k]; });
   Object.keys(DEF().settings).forEach(k => { if (S.settings[k] === undefined) S.settings[k] = DEF().settings[k]; });
+  /* 构建号：读 version.txt，让"手机上到底是哪一版"一眼能看出来 */
+  let BUILD = '';
+  try {
+    if (typeof fetch === 'function') {
+      fetch('version.txt?t=' + Date.now()).then(r => r.text()).then(t => {
+        BUILD = (t || '').trim();
+        if (S.tab === 'set') viewSet();
+      }).catch(() => {});
+    }
+  } catch (e) {}
+
   /* 老版本迁移 */
   if (!S.v || S.v < 2) {
     if (S.settings.weekendMax > 60) S.settings.weekendMax = 60;   // 120 太松，会把大菜排到周末
@@ -514,7 +525,7 @@
       </div>
       <div class="sec-title">关于</div>
       <div class="card muted" style="font-size:12.5px;line-height:1.7">
-        v0.7 · 菜谱 53 道 + 36 道新菜推荐，不想吃的可以移进备选库；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
+        v0.8 · 构建 ${esc(BUILD || '…')} · 菜谱 53 道 + 36 道新菜推荐，不想吃的可以移进备选库；采购单按保质期自动分单，价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
         数字都是查表算的：卡路里按食材克数 × 每 100g 热量（含主食）；成本按整包价折算。
       </div>`;
     document.querySelectorAll('[data-act=pname]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].name = e.target.value; save(); });
