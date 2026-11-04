@@ -303,7 +303,10 @@
         if (!cands.length) cands = pool.filter(d => okStaple(d) && base(d));
         /* 最后兜底：撞菜/上限/相邻这些都让步，只保证"放得住、来得及、是这类主食"，
            否则极端情况（比如备选库里移走了很多菜）会整周排空 */
-        if (!cands.length) cands = pool.filter(d => !arch.has(d.id) && d.min <= limit && shelfOf(d) >= age + 1 && okStaple(d));
+        if (!cands.length) cands = pool.filter(d => !arch.has(d.id) && !chosen.has(d.id) &&
+          d.min <= limit && shelfOf(d) >= age + 1 && okStaple(d));
+        /* 真到这一步只放宽"难度/保质期/14 天内吃过"，绝不重复本周已经排过的菜 */
+        if (!cands.length) cands = pool.filter(d => !arch.has(d.id) && !chosen.has(d.id) && okStaple(d));
         if (!cands.length) { ok = false; break; }
 
         let pick = cands[Math.floor(Math.random() * cands.length)], sc = 0, bestLocal = -1e9;
@@ -361,9 +364,32 @@
     });
     return g;
   }
+  /* 这一顿要用的东西是不是全在库存里（用来判断"到货第 N 天"还有没有意义） */
+  function mealInStock(state, m) {
+    if (!m || !m.dishes || !m.dishes.length) return false;
+    const scale = Math.max(1, (m.eaters && m.eaters.length) || eatDefault(state));
+    const onDate = m.date || todayStr();
+    let any = false;
+    for (const id of m.dishes) {
+      const d = DISH[id]; if (!d) continue;
+      for (const x of d.ing) {
+        if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) continue;
+        const it = ING[x.key];
+        if (!it || it.pantry) continue;
+        any = true;
+        if (invQty(state, x.key, onDate) < x.g * scale) return false;
+      }
+    }
+    if (m.rice) {
+      const st = stapleOf(state, m);
+      any = true;
+      if (invQty(state, st.key, onDate) < m.rice * st.rawPerBowl) return false;
+    }
+    return any;
+  }
+
   /* 这项食材最早哪天到期（当天起算还剩几天），没有记录返回 null */
-  function invDays(state, key, onDate) {
-    const d0 = onDate || todayStr();
+  function invDays(state, key, onDate) {    const d0 = onDate || todayStr();
     let best = null;
     (state.inventory || []).forEach(it => {
       if (it.key !== key || !it.exp || it.exp < d0) return;
@@ -445,25 +471,96 @@
     return it.shelf;
   }
 
-  function shopping(ws, state) {
-    const bs = batchesOf(ws);
-    const out = bs.map(b => ({ ...b, items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, covers: [] }));
-    const plans = state.plans || {};
-    const anyPlan = Object.keys(plans).length > 0;
-    if (!anyPlan) return { ws, batches: [] };
+  /* ---------- 采购波次：从菜单和保质期里长出来 ---------- */
+  /* 一天要用到的食材（不含可选项、水、做好的饭），返回 key 集合 */
+  function dayKeys(state, date) {
+    const pl = (state.plans || {})[mondayOf(date)];
+    const m = pl && (pl.days || []).find(x => x.date === date);
+    if (!m || m.status !== 'cook' || !m.dishes || !m.dishes.length) return [];
+    const set = new Set();
+    m.dishes.forEach(id => {
+      const d = DISH[id]; if (!d) return;
+      d.ing.forEach(x => {
+        if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) return;
+        const it = ING[x.key];
+        if (!it || it.pantry) return;
+        set.add(x.key);
+      });
+    });
+    return [...set];
+  }
 
+  /* 把未来的饭按"这一单能送到哪天还不坏"切成若干单 */
+  function wavesOf(state, from, horizon) {
+    const days = [];
+    for (let i = 0; i < (horizon || 21); i++) {
+      const d = addD(from, i);
+      if (dayKeys(state, d).length) days.push(d);
+    }
+    const waves = [];
+    let i = 0;
+    while (i < days.length) {
+      const start = days[i];
+      let end = i;
+      while (end + 1 < days.length) {
+        const nd = days[end + 1];
+        if (dspan(start, nd) >= 7) break;                        // 一单最多覆盖一周
+        const ok = dayKeys(state, nd).every(k => dspan(start, nd) <= Math.max(1, keepDays(k) - 1));
+        if (!ok) break;
+        end++;
+      }
+      waves.push({ deliver: start, days: days.slice(i, end + 1) });
+      i = end + 1;
+    }
+    /* 小单合并：只有一两样、而且都放得住，就并到前一单，省一趟 */
+    for (let k = waves.length - 1; k > 0; k--) {
+      const w = waves[k], prev = waves[k - 1];
+      const keys = new Set();
+      w.days.forEach(d => dayKeys(state, d).forEach(x => keys.add(x)));
+      const last = w.days[w.days.length - 1];
+      const ok = keys.size > 0 && keys.size <= 2 &&
+        [...keys].every(x => keepDays(x) >= 5 && dspan(prev.deliver, last) <= keepDays(x) - 1);
+      if (ok) { prev.days = prev.days.concat(w.days); waves.splice(k, 1); }
+    }
+    /* 想省事：一周只买一次 —— 按自然周合并（放不住的食材交给"这顿做了/换一道"去处理） */
+    if (state && state.settings && state.settings.shopMode === 'week') {
+      const byWeek = new Map();
+      waves.forEach(w => {
+        const k = mondayOf(w.days[0]);
+        if (!byWeek.has(k)) byWeek.set(k, { deliver: w.deliver, days: [] });
+        byWeek.get(k).days = byWeek.get(k).days.concat(w.days);
+      });
+      return [...byWeek.values()];
+    }
+    return waves;
+  }
+
+  /* 某一顿属于哪一单 */
+  function waveFor(state, date, from) {
+    const start = from || (todayStr() < date ? todayStr() : addD(date, -20));
+    const ws = wavesOf(state, start, Math.max(21, dspan(start, date) + 3));
+    return ws.find(w => w.days.indexOf(date) >= 0) || null;
+  }
+
+  function shopping(ws, state) {
+    const plans = state.plans || {};
+    const today = todayStr();
+    if (!Object.keys(plans).length) return { ws, batches: [] };
+    const from = ws > today ? ws : today;
+    const waves = wavesOf(state, from, 21);
+    if (!waves.length) return { ws, batches: [] };
+    const out = waves.map((w, i) => ({
+      b: i, order: w.deliver, deliver: w.deliver, days: w.days,
+      name: (w.deliver === today ? '今天 ' : WEEK_CN[dow(w.deliver)] + ' ') + md(w.deliver),
+      note: w.days.length > 1 ? `送 ${md(w.deliver)}–${md(w.days[w.days.length - 1])}` : `送 ${md(w.deliver)}`,
+      items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, covers: []
+    }));
     const eaters = (state.profiles || []).length || 1;
 
-    /* 一单实际服务的不是"本周"，而是从上一次到货到下一次到货之间的每一顿：
-       周日单吃 周日/周一/周二，周三单吃 周三/周四/周五/周六。
-       所以周日那单里既有本周周一、周二的菜，也有上周日的晚饭——那才是这一车的真实金额。 */
+    /* 每一单服务的，就是它覆盖的那几天（由保质期算出来的，不再是固定星期几） */
     out.forEach((b, i) => {
-      const D = b.deliver;
-      const isLast = i === out.length - 1;
-      const end = isLast ? addD(D, 2) : addD(out[i + 1].deliver, -1);
-      for (let dt0 = D; dt0 <= end; dt0 = addD(dt0, 1)) {
+      for (const dt0 of b.days) {
         const pw = mondayOf(dt0);
-        if (isLast && pw !== ws && !plans[pw]) continue;   // 下周还没排就不算这单
         const pl = plans[pw];
         if (!pl) continue;
         const m = (pl.days || []).find(x => x.date === dt0);
@@ -496,6 +593,9 @@
     /* 按时间顺序结算：上一单用不完的、且还放得住的，抵扣下一单。
        但如果上一单已经"买了"，那些余量已经进库存了，就不能再算一次 carry。 */
     const leftover = {};
+    /* 库存要一单一单往下扣，不能每单都拿今天的全部库存去抵 */
+    const stockLeft = {};
+    Object.keys(ING).forEach(k => { stockLeft[k] = invQty(state, k, from); });
     const isOrdered = d => !!((state.ordered || {})[d]);
     let prevOrdered = false;
     out.forEach(b => {
@@ -516,15 +616,18 @@
         }
         const sku = skuOf(key, state);
         if (!sku || !sku.specG) { b.have.push({ key, name: it.name, g: Math.round(need), note: '自备' }); return; }
-        const fromInv = invQty(state, key, b.deliver);
+        const fromInv = stockLeft[key] || 0;
         const carry = leftover[key] || 0;
         const avail = fromInv + carry;
         const net = need - avail;
         if (net <= 0) {
+          const useInv = Math.min(fromInv, need);
+          stockLeft[key] = fromInv - useInv;
           b.have.push({ key, name: it.name, g: Math.round(need), note: carry > 0 ? '上一单剩的' : '库存够' });
-          if (carry > 0) leftover[key] = carry - Math.max(0, need - fromInv);
+          if (carry > 0) leftover[key] = Math.max(0, carry - Math.max(0, need - useInv));
           return;
         }
+        stockLeft[key] = 0;
         const packs = Math.max(1, Math.ceil(net / sku.specG));
         const gain = packs * sku.specG;
         const rest = gain - net;
@@ -559,6 +662,7 @@
       b.opt = Object.keys(b.optSet || {}).map(k => ({ key: k, name: (ING[k] || {}).name || k, g: Math.round(b.optSet[k]) }));
       b.restock = [...new Map(b.restock.map(r => [r.key, r])).values()];
       b.ordered = isOrdered(b.deliver);
+      b.past = b.deliver < todayStr();                   // 这单的下单日已经过去
       prevOrdered = b.ordered;
     });
 
@@ -634,6 +738,7 @@
     DAY, WEEK_CN, DISH, ING, SUGGEST, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
     invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal, stapleKind, stapleWeek,
-    priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore
+    priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore, mealInStock,
+    wavesOf, waveFor, dayKeys
   };
 })(typeof window !== 'undefined' ? window : globalThis);

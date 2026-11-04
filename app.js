@@ -109,6 +109,8 @@
   function freshBadge(m) {
     const age = m.age || 0;
     if (m.status !== 'cook') return '';
+    /* 食材全在库存里的时候，"到货第 N 天"没有意义（你并不需要这单买东西） */
+    if (C.mealInStock(S, m)) return '<span class="badge ok">库存够</span>';
     if (age === 0) return '<span class="badge">刚送到</span>';
     if (age <= 1) return '';
     return `<span class="badge warn">到货第 ${age + 1} 天</span>`;
@@ -224,6 +226,11 @@
         <span class="sp"></span><button class="btn" style="padding:6px 11px;font-size:13px" data-act="regen">重排</button></div>
       </div>`;
     let lastWeek = '';
+    /* 到货天数现在是"这天离它所属那一单的送达到底几天"，由波次算出来 */
+    const ageMap = {};
+    (C.shopping(S.weekStart, S).batches || []).forEach(b => {
+      (b.days || []).forEach(d => { ageMap[d] = C.dspan(b.deliver, d); });
+    });
     days.forEach(date => {
       const ws = C.mondayOf(date);
       if (ws !== lastWeek) {
@@ -231,6 +238,7 @@
         lastWeek = ws;
       }
       const m = mealForDate(date) || { date, status: 'empty', dishes: [], rice: 0 };
+      if (ageMap[date] != null) m.age = ageMap[date];
       html += mealCard(m);
     });
     html += `<div class="muted center" style="margin:14px 0 6px">点任意一天可换菜 / 外食 / 改人数 / 锁定</div>`;
@@ -238,25 +246,33 @@
   }
 
   /* ---------------- 采购 ---------------- */
-  let shopBatch = 0;
+  let shopBatch = -1;                     // -1 = 自动选"还没下单的那一单"
+  /* 默认停在"还没下单的那一单"，别一进来就是一车过去的菜 */
+  function firstOpenBatch() {
+    const sh = C.shopping(S.weekStart, S);
+    const i = sh.batches.findIndex(x => !x.past);
+    return i < 0 ? 0 : i;
+  }
   function viewShop() {
     const sh = C.shopping(S.weekStart, S);
+    if (shopBatch < 0 || shopBatch >= sh.batches.length) shopBatch = firstOpenBatch();
     if (!sh.batches.length) {
       $('#view').innerHTML = `<div class="card" style="text-align:center;padding:22px">
         <div style="margin-bottom:6px">还没有排菜，先排一周</div>
         <button class="btn primary" data-act="goto" data-arg="week">去排菜</button></div>`;
       return;
     }
-    const bi = Math.min(shopBatch, sh.batches.length - 1);
+    const bi = shopBatch;
     const b = sh.batches[bi];
+    const past = !!b.past;
     const checked = S.checked[S.weekStart + ':' + bi] || {};
     const pct = Math.min(100, b.total / 39 * 100);
     const items = b.items.map(x => {
-      const on = checked[x.key];
+      const on = past ? false : checked[x.key];
       const pack = x.rest >= x.specG * 0.45
         ? `<span class="badge warn">整包 ${x.specG}g · 剩 ${x.rest}g</span>` : '';
       const early = x.early ? `<span class="badge ok">提前到这一单</span>` : '';
-      return `<div class="item ${on ? 'done' : ''}" data-act="chk" data-arg="${bi}:${x.key}">
+      return `<div class="item ${on ? 'done' : ''}" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>
         <div class="cb ${on ? 'on' : ''}">✓</div>
         <div style="flex:1;min-width:0">
           <div class="nm">${esc(x.name)} ×${x.packs} ${pack}${early}</div>
@@ -264,11 +280,22 @@
         </div>
         <div class="pr">${C.yuan(x.unit * x.packs)}</div></div>`;
     }).join('');
-    const f = b.gap > 0 && b.items.length ? C.fillers(b).slice(0, 4) : [];
+    const f = !past && b.gap > 0 && b.items.length ? C.fillers(b).slice(0, 4) : [];
     const fSum = f.reduce((a, x) => a + x.price, 0);
     const fAll = b.total + fSum;
     const fix = f.find(x => x.price >= b.gap);            // 加它就能过 39
-    const sumCard = b.items.length ? `
+    const sumCard = past ? `
+      <div class="card sum-card" style="opacity:.8">
+        <div class="row">
+          <div><div class="muted">${b.note}</div><div class="sum-num">${C.yuan(b.total)}</div></div>
+          <span class="sp"></span>
+          <div style="text-align:right">${b.ship ? `<span class="badge warn">运费 ¥3</span>` : `<span class="badge">免运费</span>`}
+            <div class="muted" style="margin-top:4px">共 ${b.items.reduce((a, x) => a + x.packs, 0)} 件</div></div>
+        </div>
+        <div class="muted" style="margin-top:6px">这一单的下单日（${C.md(b.deliver)}）已经过去了，下面只是那车菜的参考明细。真要改计划，请改还没下单的那几单。</div>
+        <div class="covers">当时吃 ${b.covers.length} 顿：${b.covers.map(c =>
+          `<span class="${c.week === 'adj' ? 'adj' : ''}">${C.WEEK_CN[C.dow(c.date)]} ${C.md(c.date)}</span>`).join(' · ')}</div>
+      </div>` : b.items.length ? `
       <div class="card sum-card">
         <div class="row">
           <div><div class="muted">${b.note}</div><div class="sum-num">${C.yuan(b.total)}</div></div>
@@ -295,6 +322,8 @@
       </div>`;
     $('#view').innerHTML = `
       ${sh.batches.every(x => !x.items.length) ? `<div class="hint" style="margin-bottom:10px">这一周的食材家里都有，<b>不用下单</b>。想少花点钱的话，可以把「一周做几顿荤菜」调高一点，多吃点冰箱里的。</div>` : ''}
+      <div class="hint" style="margin-bottom:10px">接下来要买 ${sh.batches.length} 次：${sh.batches.map((x, i) =>
+        `<span class="link" data-act="batch" data-arg="${i}">${esc(x.name)}${x.items.length ? ' ' + C.yuan(x.total) : '（不用买）'}</span>`).join(' · ')}</div>
       <div class="batch-tabs">${sh.batches.map((x, i) =>
         `<button class="chip ${i === bi ? 'on' : ''}" data-act="batch" data-arg="${i}">${x.name}</button>`).join('')}</div>
       ${sumCard}
@@ -303,7 +332,7 @@
           <span class="muted">${esc(x.spec)}</span><b style="margin-left:8px">¥${x.price}</b></div>`).join('')}
         <div class="muted" style="margin-top:6px;border-top:1px dashed var(--line);padding-top:6px">
           全加 ¥${fSum.toFixed(2)} → 合计 ${C.yuan(fAll)}${fAll >= 39 ? '，免运费' : `，仍差 ${C.yuan(39 - fAll)}`}</div></div>` : ''}
-      <div class="sec-title">要买 ${b.items.length} 样</div>
+      <div class="sec-title">要买 ${b.items.length} 样${past ? '（当时）' : ''}</div>
       <div class="card">${items || '<div class="muted">这一单不用买生鲜</div>'}</div>
       ${b.opt.length ? `<div class="sec-title">可选加的</div><div class="card" style="padding:8px 14px">
         ${b.opt.map(x => `<div class="row" style="padding:4px 0"><span class="muted">${esc(x.name)}</span><span class="sp"></span><span class="muted">${x.g}g</span></div>`).join('')}</div>` : ''}
@@ -317,11 +346,12 @@
         <div class="row"><span>${b.restock.map(r => esc(r.name)).join('、')}</span></div>
         <div class="muted" style="margin-top:6px">你在「库存」里标了待补。七鲜没有固定规格价，没算进金额；买完点回「充足」就行。</div>
       </div>` : ''}
+      ${past ? `<div class="hint" style="margin:14px 0">这一单已经过去了。要看接下来买什么，点上面「周三单 / 周日单(下周)」，或者翻到下一周。</div>` : `
       <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="buy" data-arg="${bi}">${b.ordered ? '这单已记进库存（点一下撤销）' : '这单买了 → 记进库存'}</button></div>
       <div class="row" style="margin-top:-6px;margin-bottom:14px"><button class="btn block" data-act="copy" data-arg="${bi}">复制清单</button></div>
       <div class="hint">点「这单买了」以后，整包的量会进库存，后面的排期和采购会自动扣掉，不用再买第二遍。
         买完回来点「回填实付」，填一次真实扣款，之后所有估价都按你的券后价来（现在是 ${
-        b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。</div>`;
+        b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。</div>`}`;
   }
 
   /* ---------------- 菜库 ---------------- */
@@ -450,6 +480,12 @@
           ${[1, 2, 3, 4].map(n => `<button class="chip ${(s.eatersDefault || 1) === n ? 'on' : ''}" data-act="seteaters" data-arg="${n}">${n} 人</button>`).join('')}
         </div>
         <div class="muted" style="margin-bottom:10px">影响用量和热量；某天来客人，在当天抽屉里单独调就行。</div>
+        <label class="fld">采购节奏</label>
+        <div class="chips" style="margin:0 0 2px">
+          <button class="chip ${s.shopMode !== 'week' ? 'on' : ''}" data-act="shopmode" data-arg="auto">按保质期分单</button>
+          <button class="chip ${s.shopMode === 'week' ? 'on' : ''}" data-act="shopmode" data-arg="week">一周只买一次</button>
+        </div>
+        <div class="muted" style="margin-bottom:10px">「按保质期分单」会算好哪天该补一次菜，叶菜不会放到第 5 天；「一周只买一次」就是一车买齐一周。</div>
         <label class="fld">工作日最多做多久（分钟）</label>
         <input type="number" value="${s.weekdayMax}" data-act="setnum" data-arg="weekdayMax">
         <label class="fld">周末最多做多久（分钟）</label>
@@ -722,7 +758,7 @@
   /* ---------------- 动作 ---------------- */
   const riceFor = kind => (kind === 'onepot' ? 0 : C.constraints(S).riceDefault);
   function sheetPaid() {
-    const sh = C.shopping(S.weekStart, S), b = sh.batches[Math.min(shopBatch, sh.batches.length - 1)];
+    const sh = C.shopping(S.weekStart, S), b = sh.batches[shopBatch];
     const est = b.total, raw = b.rawTotal || est;
     showSheet(`
       <h2>回填实付</h2>
@@ -903,9 +939,10 @@
     resetprice: () => { S.priceFactor = 1; S.paid = {}; save(); viewShop(); toast('已恢复七鲜标价'); },
     setrice: v => { S.settings.riceGrams = Math.max(30, Math.min(500, +v || 130)); save(); viewSet(); },
     setmeat: n => { S.settings.meatPerWeek = +n; save(); viewSet(); },
+    shopmode: m => { S.settings.shopMode = m === 'week' ? 'week' : 'auto'; shopBatch = 0; save(); viewSet(); },
     setstaple: k => { S.settings.staple = k; save(); viewSet(); },
     seteaters: n => { S.settings.eatersDefault = +n; save(); viewSet(); },
-    goto: t => { S.tab = t; save(); render(); },
+    goto: t => { S.tab = t; if (t === 'shop') shopBatch = -1; save(); render(); },
     addprofile: () => { S.profiles.push({ id: 'p' + Date.now(), name: '家人', portion: 1 }); save(); viewSet(); },
     delprofile: i => {
       if (S.profiles.length <= 1) return toast('至少留一个人');
@@ -1012,12 +1049,12 @@
     if (a === 'pickkind') CURRENT_PICK = CURRENT_PICK || null;
     ACT[a](el.dataset.arg);
   });
-  document.querySelectorAll('#tabbar button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; save(); render(); window.scrollTo(0, 0); });
-  $('#btnPrev').onclick = () => { S.weekStart = C.addD(S.weekStart, -7); shopBatch = 0; save(); render(); };
-  $('#btnNext').onclick = () => { S.weekStart = C.addD(S.weekStart, 7); shopBatch = 0; save(); render(); };
+  document.querySelectorAll('#tabbar button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; if (S.tab === 'shop') shopBatch = -1; save(); render(); window.scrollTo(0, 0); });
+  $('#btnPrev').onclick = () => { S.weekStart = C.addD(S.weekStart, -7); shopBatch = -1; save(); render(); };
+  $('#btnNext').onclick = () => { S.weekStart = C.addD(S.weekStart, 7); shopBatch = -1; save(); render(); };
 
   const h0 = (() => { try { return (location.hash || '').replace('#', ''); } catch (e) { return ''; } })();
-  if (TABS.indexOf(h0) >= 0) S.tab = h0;
+  if (TABS.indexOf(h0) >= 0) { S.tab = h0; if (h0 === 'shop') shopBatch = -1; }
   render();
   if (!S.seen) { S.seen = true; save(); }
   try {
