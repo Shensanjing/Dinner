@@ -348,7 +348,7 @@
     if (!best) {
       best = days.map(date => ({ date, dishes: [], protein: '素', status: 'empty', locked: false, rice: 0, age: 0 }));
     }
-    return { weekStart: ws, days: best };
+    return { weekStart: ws, created: todayStr(), days: best };
   }
 
   /* ---------- 库存 ---------- */

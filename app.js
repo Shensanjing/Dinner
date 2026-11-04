@@ -22,8 +22,8 @@
     ].map(x => ({ id: uid(), ...x }));
   }
   const DEF = () => ({
-    v: 3, tab: 'week', weekStart: C.mondayOf(today()),
-    plans: {}, inventory: seedInventory(), pantry: {}, custom: [], archived: [], customIng: [],
+    v: 4, tab: 'week', weekStart: C.mondayOf(today()), day0: today(),
+    plans: {}, history: {}, inventory: seedInventory(), pantry: {}, custom: [], archived: [], customIng: [],
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
       weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
@@ -48,6 +48,13 @@
     }
     delete S.settings.ricePerMeal;
     S.v = 3;
+  }
+  if (!S.v || S.v < 4) {
+    /* v4：历史改成"过一天拍一张快照"，不再拿当前计划回算。
+       老计划的 created 一律记成今天 —— 之前的日子本来就没按那个计划吃过。 */
+    S.history = S.history || {};
+    Object.values(S.plans || {}).forEach(p => { if (p && !p.created) p.created = today(); });
+    S.v = 4;
   }
   C.hydrateCustom(S);   // 用户自己收进菜谱的菜要能被排期和采购认出来
   /* 日程页以"今天"为顶，每次打开都重新对齐到本周一，跨周不用手动翻 */
@@ -142,29 +149,53 @@
     const p = plan(C.mondayOf(date));
     return p ? p.days.find(m => m.date === date) || null : null;
   }
-  /* 往后补排：缺哪周就排哪周，已锁定的不动 */
+  /* 往后补排：缺哪周就排哪周，已锁定的不动；已经过去的那几周不补 */
   function ensureAhead(weeks) {
     let changed = false;
+    const cur = C.mondayOf(today());
     for (let i = 0; i <= weeks; i++) {
       const ws = C.mondayOf(C.addD(S.weekStart, i * 7));
+      if (ws < cur) continue;
       if (!S.plans[ws]) { S.plans[ws] = C.generate(ws, S); changed = true; }
     }
     if (changed) save();
   }
-  /* 过去 N 天：吃了什么、多少能量、花了多少钱 */
+  /* 历史快照：过一天就拍一张，之后重排菜单不会改动它 */
+  function syncHistory() {
+    const t = today();
+    S.history = S.history || {};
+    let changed = false;
+    Object.keys(S.plans || {}).forEach(ws => {
+      const p = S.plans[ws];
+      if (!p || !p.days) return;
+      const from = p.created || t;          // 计划没建立之前的日子不算"吃过"
+      p.days.forEach(m => {
+        if (!(m.date < t && m.date >= from)) return;
+        const d = m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
+        const out = m.status === 'out';
+        if (!d && !out) return;
+        const old = S.history[m.date];
+        if (!old) { S.history[m.date] = { name: d ? d.name : '外食', kcal: d ? C.mealKcal(S, m) : 0, out, done: !!m.done }; changed = true; }
+        else if (m.done && !old.done) { old.done = true; changed = true; }
+      });
+    });
+    return changed;
+  }
+  /* 过去 N 天：只读历史快照，不再从当前计划回算 */
   function pastStats(n) {
     const out = { days: [], kcal: 0, done: 0, spend: 0, shopN: 0 };
-    for (let i = n; i >= 1; i--) {
-      const date = C.addD(today(), -i);
-      const m = mealForDate(date);
-      const d = m && m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
-      if (!d && !(m && m.status === 'out')) continue;
-      out.days.push({ date, name: d ? d.name : '外食', kcal: m ? C.mealKcal(S, m) : 0, done: !!(m && m.done), out: m && m.status === 'out' });
-      if (d) out.kcal += C.mealKcal(S, m);
-      if (m && m.done) out.done++;
-    }
+    const t = today();
+    Object.keys(S.history || {}).forEach(date => {
+      const gap = C.dspan(date, t);
+      if (gap <= 0 || gap > n) return;
+      const x = S.history[date] || {};
+      out.days.push({ date, name: x.name || '', kcal: x.kcal || 0, done: !!x.done, out: !!x.out });
+      out.kcal += x.kcal || 0;
+      if (x.done) out.done++;
+    });
+    out.days.sort((a, b) => (a.date < b.date ? 1 : -1));
     Object.keys(S.ordered || {}).forEach(k => {
-      const gap = C.dspan(k, today());
+      const gap = C.dspan(k, t);
       if (gap > 0 && gap <= n + 6) { out.spend += (S.ordered[k].total || 0); out.shopN++; }
     });
     return out;
@@ -294,48 +325,49 @@
   }
 
   /* ---------------- 菜库 ---------------- */
-  let libQ = '', libKind = '', libTab = 'mine', newSeed = 1;
+  let libQ = '', libKind = '', libTab = 'mine', newPage = 0;
   const customIds = () => new Set((S.custom || []).map(d => d.id));
   const archIds = () => new Set(S.archived || []);
   const dishById = id => DISH[id] || (C.SUGGEST || []).find(x => x.id === id);
   /* 我的菜谱：原始 53 道去掉移出的，再加上自己收编的 */
   const isMine = d => (!d.src || d.src !== 'suggest' || customIds().has(d.id)) && !archIds().has(d.id);
-  /* 推荐菜按种子打乱，「换一批」就是换种子 */
-  function shuffledFresh(list, seed) {
-    const a = list.slice();
-    let x = (seed * 9301 + 49297) % 233280;
-    for (let i = a.length - 1; i > 0; i--) {
-      x = (x * 9301 + 49297) % 233280;
-      const j = Math.floor(x / 233280 * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
-  }
+  /* 推荐菜按固定顺序一屏 8 道，「换一批」是往后翻一屏，真的换成别的菜 */
+  const NEW_PER = 8;
   function viewLib() {
     const all = Object.values(DISH);
     const mine = all.filter(isMine);
     const arch = (S.archived || []).map(dishById).filter(Boolean);
-    const fresh = shuffledFresh((C.SUGGEST || []).filter(d => !customIds().has(d.id) && !archIds().has(d.id)), newSeed);
-    const base = libTab === 'new' ? fresh : (libTab === 'arch' ? arch : mine);
-    const list = base.filter(d =>
+    const pool = (C.SUGGEST || []).slice().sort((a, b) => (a.id < b.id ? -1 : 1))
+      .filter(d => !customIds().has(d.id) && !archIds().has(d.id));
+    const hit = list => list.filter(d =>
       (!libKind || d.kind === libKind) &&
       (!libQ || d.name.includes(libQ) || d.ing.some(i => i.name.includes(libQ))));
+    const freshAll = hit(pool);
+    const pages = Math.max(1, Math.ceil(freshAll.length / NEW_PER));
+    const pg = newPage % pages;
+    const base = libTab === 'new'
+      ? freshAll.slice(pg * NEW_PER, pg * NEW_PER + NEW_PER)
+      : hit(libTab === 'arch' ? arch : mine);
+    const list = base;
     const tip = libTab === 'new' ? ' · 没做过的，试过觉得行就收进菜谱'
       : libTab === 'arch' ? ' · 移出来的菜不参与自动排期，想吃了再加回去'
         : ' · 不想再吃的点「移出」';
+    const countTxt = libTab === 'new'
+      ? `第 ${pg + 1}/${pages} 批 · 共 ${freshAll.length} 道推荐${libQ || libKind ? '（已筛选）' : ''}`
+      : `${list.length} 道${tip}`;
     $('#view').innerHTML = `
       <div class="chips" style="margin-bottom:8px">
         <button class="chip ${libTab === 'mine' ? 'on' : ''}" data-act="libtab" data-arg="mine">我的菜谱 ${mine.length}</button>
         <button class="chip ${libTab === 'arch' ? 'on' : ''}" data-act="libtab" data-arg="arch">备选库 ${arch.length}</button>
-        <button class="chip ${libTab === 'new' ? 'on' : ''}" data-act="libtab" data-arg="new">新菜推荐 ${fresh.length}</button>
+        <button class="chip ${libTab === 'new' ? 'on' : ''}" data-act="libtab" data-arg="new">新菜推荐 ${freshAll.length}</button>
       </div>
       <input type="text" id="libq" placeholder="搜菜名或食材，比如：茄子" value="${esc(libQ)}">
-      ${libTab === 'new' ? `<button class="btn ghost" style="margin-top:8px" data-act="newfresh">换个花样 · 换一批</button>` : ''}
+      ${libTab === 'new' ? `<button class="btn ghost" style="margin-top:8px" data-act="newfresh">换一批（按 id 往后翻，36 道里轮换）</button>` : ''}
       <div class="chips" style="margin-top:10px">
         ${['', 'meat', 'half', 'veg', 'onepot'].map(k =>
           `<button class="chip ${libKind === k ? 'on' : ''}" data-act="libkind" data-arg="${k}">${k ? KIND[k] : '全部'}</button>`).join('')}
       </div>
-      <div class="muted" style="margin:2px 2px 8px">${list.length} 道${tip}</div>
+      <div class="muted" style="margin:2px 2px 8px">${countTxt}</div>
       ${list.map(d => `<div class="card" style="padding:11px 14px" data-act="dish" data-arg="${d.id}">
         <div class="row"><span class="dish-name" style="font-size:15.5px">${esc(d.name)}</span>
         ${d.src === 'suggest' && !customIds().has(d.id) ? '<span class="badge warn">未尝试</span>' : ''}
@@ -397,7 +429,8 @@
           <input type="text" value="${esc(p.name)}" data-act="pname" data-arg="${i}" style="flex:1">
           <select data-act="pportion" data-arg="${i}" style="width:96px">
             ${[0.6, 0.8, 1, 1.3, 1.6].map(v => `<option value="${v}" ${v === p.portion ? 'selected' : ''}>${v} 人份</option>`).join('')}
-          </select></div>`).join('')}
+          </select>
+          ${S.profiles.length > 1 ? `<button class="link" style="margin-left:6px;background:none;border:0;color:#c0563a" data-act="delprofile" data-arg="${i}">删除</button>` : ''}</div>`).join('')}
         <button class="btn block" style="margin-top:8px" data-act="addprofile">＋ 加一个人</button>
       </div>
       <div class="sec-title">排期偏好</div>
@@ -445,7 +478,7 @@
       </div>
       <div class="sec-title">关于</div>
       <div class="card muted" style="font-size:12.5px;line-height:1.7">
-        v0.4 · 菜谱 53 道 + 20 道新菜推荐，不想吃的可以移进备选库；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
+        v0.7 · 菜谱 53 道 + 36 道新菜推荐，不想吃的可以移进备选库；价格为七鲜标价（¥39 免运费，未满 +¥3），可回填实付校准。<br>
         数字都是查表算的：卡路里按食材克数 × 每 100g 热量（含主食）；成本按整包价折算。
       </div>`;
     document.querySelectorAll('[data-act=pname]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].name = e.target.value; save(); });
@@ -464,8 +497,11 @@
   }
   function render() {
     ensureInvIds();
-    S.weekStart = C.mondayOf(today());   // 日程按"今天"对齐，跨周自动接上
+    /* 换天了才重新对到本周一：平时保留用户自己点左右翻出来的那一周 */
+    const t = today();
+    if (S.day0 !== t) { S.day0 = t; S.weekStart = C.mondayOf(t); }
     if (S.tab === 'week' || S.tab === 'shop') ensureAhead(1);
+    if (syncHistory()) save();
     renderTop();
     ({ week: viewWeek, shop: viewShop, lib: viewLib, inv: viewInv, set: viewSet }[S.tab] || viewWeek)();
     syncHash();
@@ -760,7 +796,7 @@
     chk: a => { const [bi, key] = a.split(':'); const k = S.weekStart + ':' + bi; S.checked[k] = S.checked[k] || {}; S.checked[k][key] = !S.checked[k][key]; save(); viewShop(); },
     libkind: k => { libKind = k; viewLib(); },
     libtab: k => { libTab = k; viewLib(); },
-    newfresh: () => { newSeed = (newSeed + 1) % 9973; libQ = ''; viewLib(); toast('换了一批'); },
+    newfresh: () => { newPage += 1; libQ = ''; viewLib(); try { window.scrollTo(0, 0); } catch (e) {} },
     hist: () => { histOpen = !histOpen; viewWeek(); },
     eaters: d => {
       const m = mealForDate(d) || mealAt(C.mondayOf(d), d);
@@ -871,6 +907,17 @@
     seteaters: n => { S.settings.eatersDefault = +n; save(); viewSet(); },
     goto: t => { S.tab = t; save(); render(); },
     addprofile: () => { S.profiles.push({ id: 'p' + Date.now(), name: '家人', portion: 1 }); save(); viewSet(); },
+    delprofile: i => {
+      if (S.profiles.length <= 1) return toast('至少留一个人');
+      const gone = S.profiles[+i];
+      S.profiles.splice(+i, 1);
+      /* 从各天的"谁吃"里去掉，别留孤儿 id */
+      Object.values(S.plans || {}).forEach(p => (p.days || []).forEach(m => {
+        if (m.eaters) { m.eaters = m.eaters.filter(x => x !== gone.id); if (!m.eaters.length) delete m.eaters; }
+      }));
+      if ((S.settings.eatersDefault || 1) > S.profiles.length) S.settings.eatersDefault = S.profiles.length;
+      save(); viewSet(); renderTop(); toast(`已删除 ${gone.name}`);
+    },
     addinv: () => sheetAddInv(),
     saveinv: () => {
       let key = $('#invkey').value;
@@ -988,6 +1035,7 @@
       if (ui.startsWith('dish:')) sheetDish(ui.slice(5), 1);
       else if (ui.startsWith('edit:')) sheetEditDish(ui.slice(5));
       else if (ui.startsWith('lib:')) { S.tab = 'lib'; libTab = ui.slice(4) || 'mine'; render(); }
+      else if (ui === 'addp') { S.profiles.push({ id: 'px' + Date.now(), name: '家人', portion: 1 }); S.tab = 'set'; save(); render(); }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
     }
