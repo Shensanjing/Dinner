@@ -125,12 +125,38 @@
   function eatDefault(state) {
     return Math.max(1, (state && state.settings && state.settings.eatersDefault) || 1);
   }
-  /* 一顿饭的总热量：菜 + 主食 */
+  /* 这天谁来吃：先看按日期定好的人，再看默认人数 */
+  function eaterIdsFor(state, date) {
+    const byDate = (state && state.eatersByDate) || {};
+    const ids = byDate[date];
+    if (ids && ids.length) return ids.slice();
+    const profs = (state && state.profiles) || [];
+    return profs.slice(0, eatDefault(state)).map(p => p.id);
+  }
+  /* 这几个人加起来吃几"份"（饭量 1.3 的人算 1.3 份） */
+  function portionOf(state, ids) {
+    const profs = (state && state.profiles) || [];
+    if (!ids || !ids.length) return eatDefault(state);
+    let s = 0;
+    ids.forEach(id => { const p = profs.find(x => x.id === id); s += (p && p.portion) || 1; });
+    return s > 0 ? Math.round(s * 10) / 10 : ids.length;
+  }
+  function mealEaters(state, m) {
+    if (m && m.eaters && m.eaters.length) return m.eaters;
+    return eaterIdsFor(state, m && m.date);
+  }
+  /* 一顿饭的总份数：菜量和米量都按它放大 */
+  function mealScale(state, m) { return portionOf(state, mealEaters(state, m)); }
+  /* 每道菜做几份：两个人吃两道菜，是"两人份分两道"，不是"每道都做两份" */
+  function dishScale(state, m) {
+    const n = Math.max(1, ((m && m.dishes) || []).length);
+    return Math.round((mealScale(state, m) / n) * 10) / 10;
+  }
+  /* 一顿饭的总热量：菜（可能两道）+ 主食，乘以份数 */
   function mealKcal(state, m) {
-    const d = DISH[(m.dishes || [])[0]];
-    const eaters = Math.max(1, (m.eaters || []).length || eatDefault(state));
+    const kc = (m.dishes || []).reduce((a, id) => a + ((DISH[id] || {}).kcal || 0), 0);
     const riceK = m.rice ? stapleOf(state, m).kcalPerBowl * m.rice : 0;
-    return Math.round(((d ? d.kcal : 0) + riceK) * eaters);
+    return Math.round(kc * dishScale(state, m) + riceK * mealScale(state, m));
   }
 
   /* 这道菜的主食是面还是米饭：决定这天算"面日"还是"米饭日" */
@@ -251,6 +277,32 @@
     const wantN = Math.random() < 0.45 ? 3 : 2;         // 这周吃 2 顿面还是 3 顿面，一次定死
     let best = null, bestScore = -1e9;
 
+    /* 两个人吃的时候配的第二道菜：和主菜互补、不重样、不和主菜一样的主料 */
+    const pickSecond = (date, main, taken, usedSet, archSet, age, limit) => {
+      const wantKinds = main.kind === 'meat' ? ['veg', 'half']
+        : main.kind === 'veg' ? ['half', 'meat', 'veg']
+          : ['veg', 'half'];
+      const mp = mainProtein(main);
+      const okP = d => !taken.has(d.id) && !usedSet.has(d.id) && !archSet.has(d.id)
+        && d.min <= Math.max(20, limit - main.min + 15)
+        && shelfOf(d) >= age + 1
+        && wantKinds.indexOf(d.kind) >= 0
+        && stapleKind(d) === 'plain'                 // 别在主食上打架（面/饭/盖饭不算配菜）
+        && mainProtein(d) !== mp;
+      const list = pool.filter(okP);
+      if (!list.length) return null;
+      let pick2 = null, bs2 = -1e9;
+      list.forEach(c => {
+        let v = Math.random() * 2;
+        if (c.min <= 15) v += 3; else if (c.min <= 25) v += 1;
+        if (c.spice >= 2) v += 3;
+        if (hasLeafy(c)) v += 2;
+        v += fridgeScore(state, c, date);
+        if (v > bs2) { bs2 = v; pick2 = c; }
+      });
+      return pick2;
+    };
+
     for (let attempt = 0; attempt < 180; attempt++) {
       const md = meatDays(cfg.meatPerWeek);            // 荤菜占哪几天
       const sp = stapleWeek(md, wantN);                 // 这周哪几天吃面（不会和荤菜撞）
@@ -339,11 +391,24 @@
         proteinCount[p] = (proteinCount[p] || 0) + 1;
         chosen.add(pick.id);
         const sk = stapleKind(pick);
-        picked.push({
+        const meal = {
           date, dishes: [pick.id], protein: p, kind: pick.kind, min: pick.min,
           status: 'cook', locked: false, staple: cfg.staple,
           rice: (sk === 'noodle' || sk === 'rice_dish') ? 0 : cfg.riceDefault, age
-        });
+        };
+        const eIds = eaterIdsFor(state, date);
+        const eScale = portionOf(state, eIds);
+        if (eIds.length) meal.eaters = eIds.slice();
+        /* 两个人吃就别只做一道菜：加一道互补的（荤配素、素配半荤或荤） */
+        if (eScale >= 1.8) {
+          const second = pickSecond(date, pick, chosen, used, arch, age, limit);
+          if (second) {
+            meal.dishes.push(second.id);
+            chosen.add(second.id);
+            if (second.min > meal.min) meal.min = second.min;
+          }
+        }
+        picked.push(meal);
       }
       if (ok && score - 50 * meatMiss > bestScore) { bestScore = score - 50 * meatMiss; best = picked; }
     }
@@ -367,7 +432,7 @@
   /* 这一顿要用的东西是不是全在库存里（用来判断"到货第 N 天"还有没有意义） */
   function mealInStock(state, m) {
     if (!m || !m.dishes || !m.dishes.length) return false;
-    const scale = Math.max(1, (m.eaters && m.eaters.length) || eatDefault(state));
+    const scale = dishScale(state, m);
     const onDate = m.date || todayStr();
     let any = false;
     for (const id of m.dishes) {
@@ -383,7 +448,7 @@
     if (m.rice) {
       const st = stapleOf(state, m);
       any = true;
-      if (invQty(state, st.key, onDate) < m.rice * st.rawPerBowl) return false;
+      if (invQty(state, st.key, onDate) < m.rice * st.rawPerBowl * mealScale(state, m)) return false;
     }
     return any;
   }
@@ -435,7 +500,7 @@
     const out = {};
     if (!meal) return out;
     const eaters = (state.profiles || []).length || 1;
-    const scale = Math.max(1, (meal.eaters && meal.eaters.length) || eaters);
+    const scale = dishScale(state, meal);
     (meal.dishes || []).forEach(id => {
       const d = DISH[id]; if (!d) return;
       (d.ing || []).forEach(x => {
@@ -445,7 +510,7 @@
     });
     if (meal.rice) {
       const st = stapleOf(state, meal);
-      out[st.key] = (out[st.key] || 0) + meal.rice * st.rawPerBowl;
+      out[st.key] = (out[st.key] || 0) + meal.rice * st.rawPerBowl * mealScale(state, meal);
     }
     return out;
   }
@@ -568,7 +633,7 @@
         b.covers.push({ date: dt0, name: m.dishes.map(id => (DISH[id] || {}).name).filter(Boolean).join(' + '), week: pw === ws ? 'this' : 'adj' });
         m.dishes.forEach(id => {
           const d = DISH[id]; if (!d) return;
-          const scale = Math.max(1, (m.eaters && m.eaters.length) || eatDefault(state));
+          const scale = dishScale(state, m);
           d.ing.forEach(x => {
             if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water') return;
             const grams = x.g * scale;
@@ -585,7 +650,7 @@
         });
         if (m.rice) {
           const st = stapleOf(state, m);
-          b.needs[st.key] = (b.needs[st.key] || 0) + m.rice * st.rawPerBowl;
+          b.needs[st.key] = (b.needs[st.key] || 0) + m.rice * st.rawPerBowl * mealScale(state, m);
         }
       }
     });
@@ -739,6 +804,6 @@
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
     invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal, stapleKind, stapleWeek,
     priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore, mealInStock,
-    wavesOf, waveFor, dayKeys
+    wavesOf, waveFor, dayKeys, eaterIdsFor, portionOf, mealScale, dishScale, mealEaters
   };
 })(typeof window !== 'undefined' ? window : globalThis);

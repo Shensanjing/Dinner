@@ -22,14 +22,14 @@
     ].map(x => ({ id: uid(), ...x }));
   }
   const DEF = () => ({
-    v: 4, tab: 'week', weekStart: C.mondayOf(today()), day0: today(),
+    v: 5, tab: 'week', weekStart: C.mondayOf(today()), day0: today(),
     plans: {}, history: {}, inventory: seedInventory(), pantry: {}, custom: [], archived: [], customIng: [],
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
       weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
       meatPerWeek: 3, staple: 'brown', eatersDefault: 1
     },
-    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {}
+    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {}, eatersByDate: {}
   });
   let S;
   try { S = JSON.parse(localStorage.getItem(LS)) || DEF(); } catch (e) { S = DEF(); }
@@ -66,6 +66,16 @@
     S.history = S.history || {};
     Object.values(S.plans || {}).forEach(p => { if (p && !p.created) p.created = today(); });
     S.v = 4;
+  }
+  if (!S.v || S.v < 5) {
+    /* v5：哪天几个人吃改成"按日期记"，这样重排也不会丢；老的 m.eaters 收进 eatersByDate */
+    S.eatersByDate = S.eatersByDate || {};
+    Object.values(S.plans || {}).forEach(p => {
+      (p.days || []).forEach(m => {
+        if (m && m.eaters && m.eaters.length && !S.eatersByDate[m.date]) S.eatersByDate[m.date] = m.eaters.slice();
+      });
+    });
+    S.v = 5;
   }
   C.hydrateCustom(S);   // 用户自己收进菜谱的菜要能被排期和采购认出来
   /* 日程页以"今天"为顶，每次打开都重新对齐到本周一，跨周不用手动翻 */
@@ -127,7 +137,8 @@
     return `<span class="badge warn">到货第 ${age + 1} 天</span>`;
   }
   function mealCard(m) {
-    const d = m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
+    const ds = (m.dishes || []).map(id => DISH[id]).filter(Boolean);
+    const d = ds[0] || null;
     const [y, mo, da] = m.date.split('-');
     const isToday = m.date === today();
     let inner;
@@ -139,15 +150,15 @@
     } else {
       const meta = [];
       const st = C.stapleOf(S, m);
+      const sc = C.mealScale(S, m);
       meta.push(`${C.mealKcal(S, m)} kcal`);
-      meta.push(`${d.min} 分钟`);
+      meta.push(`${Math.max(...ds.map(x => x.min))} 分钟`);
       meta.push(KIND[d.kind]);
-      if (m.rice) meta.push(`${st.name} ${m.rice} 碗`);
-      const nEat = (m.eaters && m.eaters.length) || S.settings.eatersDefault || 1;
-      if (nEat > 1) meta.push(`${nEat} 人`);
-      if (d.spice >= 2) meta.push('辣');
-      inner = `<div class="dish-line"><span class="dish-name">${esc(d.name)}</span>
-          ${d.spice >= 2 ? '<span class="badge spicy">辣</span>' : ''}
+      if (m.rice) meta.push(sc > 1 ? `${st.name} ${m.rice} 碗/人` : `${st.name} ${m.rice} 碗`);
+      if (ds.length > 1) meta.push(`${ds.length} 道菜`);
+      if (ds.some(x => x.spice >= 2)) meta.push('辣');
+      inner = `<div class="dish-line"><span class="dish-name">${ds.map(x => esc(x.name)).join(' ＋ ')}</span>
+          ${ds.some(x => x.spice >= 2) ? '<span class="badge spicy">辣</span>' : ''}
         </div><div class="dish-meta">${meta.join(' · ')}</div>`;
     }
     return `<div class="card day-card" data-act="meal" data-arg="${m.date}">
@@ -169,9 +180,19 @@
     for (let i = 0; i <= weeks; i++) {
       const ws = C.mondayOf(C.addD(S.weekStart, i * 7));
       if (ws < cur) continue;
-      if (!S.plans[ws]) { S.plans[ws] = C.generate(ws, S); changed = true; }
+      if (!S.plans[ws]) { S.plans[ws] = applyEaters(C.generate(ws, S)); changed = true; }
     }
     if (changed) save();
+  }
+  /* 生成/重排之后，把"哪天几个人吃"的设定重新贴回去（要不一重排就丢了） */
+  function applyEaters(plan) {
+    if (!plan || !plan.days) return plan;
+    plan.days.forEach(m => {
+      const ids = (S.eatersByDate || {})[m.date];
+      if (ids && ids.length) m.eaters = ids.slice();
+      else if (m.eaters && !((S.eatersByDate || {})[m.date])) delete m.eaters;
+    });
+    return plan;
   }
   /* 历史快照：过一天就拍一张，之后重排菜单不会改动它 */
   function syncHistory() {
@@ -490,7 +511,7 @@
         <div class="chips" style="margin:0 0 2px">
           ${[1, 2, 3, 4].map(n => `<button class="chip ${(s.eatersDefault || 1) === n ? 'on' : ''}" data-act="seteaters" data-arg="${n}">${n} 人</button>`).join('')}
         </div>
-        <div class="muted" style="margin-bottom:10px">影响用量和热量；某天来客人，在当天抽屉里单独调就行。</div>
+        <div class="muted" style="margin-bottom:10px">没单独指定"谁吃"的日子按这个算。某天只有两个人吃、或者来客人，在那天的抽屉里点「谁吃」勾一下——重排不会给你改回去。</div>
         <label class="fld">采购节奏</label>
         <div class="chips" style="margin:0 0 2px">
           <button class="chip ${s.shopMode !== 'week' ? 'on' : ''}" data-act="shopmode" data-arg="auto">按保质期分单</button>
@@ -566,26 +587,76 @@
 
   function sheetMeal(date) {
     const m = mealForDate(date) || { date, status: 'empty', dishes: [], rice: 0 };
-    const d = m.dishes && m.dishes[0] ? DISH[m.dishes[0]] : null;
+    const ds = (m.dishes || []).map(id => dishById(id)).filter(Boolean);
+    const d = ds[0] || null;
     const st = C.stapleOf(S, m);
     const [y, mo, da] = date.split('-');
-    const eaters = (m.eaters || S.profiles.map(p => p.id));
+    const eaters = C.mealEaters(S, m);
+    const sc = C.mealScale(S, m);
+    const who = (S.profiles || []).filter(p => eaters.indexOf(p.id) >= 0).map(p => p.name).join('、');
     showSheet(`
       <h2>${C.WEEK_CN[C.dow(date)]} ${+mo}月${+da}日</h2>
-      <div class="sheet-sub">${d ? esc(d.name) + ' · ' + C.mealKcal(S, m) + ' kcal · ' + d.min + ' 分钟' : (m.status === 'out' ? '外食' : '还没安排')}</div>
-      ${d ? `<div class="act-list">
-        <button class="act" data-act="dish" data-arg="${d.id}"><span class="em">📖</span>看食材 / 做法</button>
-      </div>` : ''}
+      <div class="sheet-sub">${d ? ds.map(x => esc(x.name)).join(' ＋ ') + ' · ' + C.mealKcal(S, m) + ' kcal · ' + Math.max(...ds.map(x => x.min)) + ' 分钟' : (m.status === 'out' ? '外食' : '还没安排')}</div>
+      ${ds.map((x, i) => `<div class="act-list">
+        <button class="act" data-act="dish" data-arg="${x.id}|${date}"><span class="em">📖</span>${ds.length > 1 ? '第 ' + (i + 1) + ' 道：' : ''}${esc(x.name)} 的食材 / 做法</button>
+      </div>`).join('')}
       <div class="act-list">
         <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '换一道' : '选一道菜'}</button>
         <button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>
         <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : (date === today() ? '今天出去吃' : '这天出去吃')}</button>
         <button class="act" data-act="lock" data-arg="${date}"><span class="em">🔒</span>${m.locked ? '解锁这顿' : '锁定这顿（重排时不动）'}</button>
-        <button class="act" data-act="eaters" data-arg="${date}"><span class="em">👥</span>这顿 ${(m.eaters && m.eaters.length) || S.settings.eatersDefault || 1} 人吃（点一下改）</button>
-        <button class="act" data-act="rice" data-arg="${date}"><span class="em">🍚</span>${st.name}：${m.rice || 0} 碗${m.rice ? `（生米 ${Math.round(m.rice * st.rawPerBowl)}g）` : ''}</button>
+        <button class="act" data-act="eaters" data-arg="${date}"><span class="em">👥</span>${who ? who + ' 吃' : '这顿谁吃'}（${eaters.length || 1} 人 · ${sc} 份，点一下改）</button>
+        <button class="act" data-act="rice" data-arg="${date}"><span class="em">🍚</span>${st.name}：每人 ${m.rice || 0} 碗${m.rice ? `（合计生米 ${Math.round(m.rice * st.rawPerBowl * sc)}g）` : ''}</button>
         <button class="act" data-act="staple" data-arg="${date}"><span class="em">🌾</span>这顿换成${st.id === 'brown' ? '白米饭' : '糙米饭'}</button>
         <button class="act danger" data-act="clear" data-arg="${date}"><span class="em">🗑</span>清空这顿</button>
       </div>`);
+  }
+
+  /* 这顿谁吃：勾人，不是改数字 —— 三个人时才能指定"今天 A 和我吃" */
+  function sheetEaters(date) {
+    const m = mealForDate(date) || mealAt(C.mondayOf(date), date) || { date, dishes: [] };
+    const cur = C.mealEaters(S, m);
+    const sc = C.portionOf(S, cur);
+    const ps = S.profiles || [];
+    const [y, mo, da] = date.split('-');
+    showSheet(`
+      <h2>这顿谁吃</h2>
+      <div class="sheet-sub">${C.WEEK_CN[C.dow(date)]} ${+mo}月${+da}日 · ${cur.length} 人，合计 ${sc} 份</div>
+      <div class="act-list">
+        ${ps.map(p => `<button class="act" data-act="etoggle" data-arg="${date}|${p.id}"><span class="em">${cur.indexOf(p.id) >= 0 ? '☑' : '☐'}</span>${esc(p.name)} · ${p.portion} 人份</button>`).join('')}
+      </div>
+      <div class="act-list">
+        <button class="act" data-act="equick" data-arg="${date}|1"><span class="em">1️⃣</span>只要一个人吃</button>
+        ${ps.length > 1 ? `<button class="act" data-act="equick" data-arg="${date}|${ps.length}"><span class="em">👨‍👩‍👧</span>所有人（${ps.length} 人）</button>` : ''}
+      </div>
+      <div class="hint" style="padding:2px 6px 12px">菜量和米量都按"份数"放大：1 人份 = 一个人正常饭量，饭量 1.3 的人算 1.3 份。两个人吃（≥1.8 份）会自动配成两道菜。</div>
+      <button class="btn" data-act="meal" data-arg="${date}">回到这顿</button>`);
+  }
+  /* 两个人吃要多一道：挑一道跟主菜互补、不太费时的 */
+  function secondDish(mainId, date) {
+    const main = dishById(mainId); if (!main) return null;
+    const kinds = main.kind === 'meat' ? ['veg', 'half'] : main.kind === 'veg' ? ['half', 'meat', 'veg'] : ['veg', 'half'];
+    const mp = C.mainProtein(main);
+    const m = mealForDate(date);
+    const taken = new Set((m && m.dishes) || []);
+    const list = Object.values(DISH).filter(d => !taken.has(d.id) && kinds.indexOf(d.kind) >= 0 &&
+      C.mainProtein(d) !== mp && d.min <= 30 && (S.archived || []).indexOf(d.id) < 0);
+    if (!list.length) return null;
+    return list[Math.floor(Math.random() * list.length)];
+  }
+  /* 改这顿的人：写进按日期的表里，重排不会丢 */
+  function setEaters(date, ids) {
+    const m = mealForDate(date) || mealAt(C.mondayOf(date), date);
+    if (!m) return;
+    m.eaters = ids.slice();
+    S.eatersByDate = S.eatersByDate || {};
+    S.eatersByDate[date] = ids.slice();
+    const sc = C.portionOf(S, ids);
+    if (sc >= 1.8 && (m.dishes || []).length === 1 && m.dishes[0]) {
+      const add = secondDish(m.dishes[0], date);
+      if (add) { m.dishes.push(add.id); if (add.min > (m.min || 0)) m.min = add.min; toast('两个人吃，又给你配了一道 ' + add.name); }
+    }
+    save();
   }
 
   function sheetDish(id, eaters) {
@@ -603,7 +674,7 @@
     showSheet(`
       <h2>${esc(d.name)}</h2>
       <div class="kv">
-        <span><b>${d.kcal * k}</b> kcal /${k}人</span><span><b>${d.min}</b> 分钟</span>
+        <span><b>${d.kcal * k}</b> kcal / ${k} 份</span><span><b>${d.min}</b> 分钟</span>
         <span><b>${KIND[d.kind]}</b></span>${d.spice ? `<span>辣度 <b>${d.spice}</b>/3</span>` : ''}
         <span>食材约 <b>${C.yuan(C.dishCost(d) * k)}</b></span>
       </div>
@@ -801,7 +872,7 @@
     weeks.forEach(ws => {
       const old = plan(ws);
       const locked = old ? old.days.filter(m => m.locked && m.dishes.length) : [];
-      const np = C.generate(ws, S);
+      const np = applyEaters(C.generate(ws, S));
       const usedByLocked = new Set(locked.map(m => m.dishes[0]));
       locked.forEach(lm => {
         const slot = np.days.find(x => x.date === lm.date);
@@ -822,11 +893,20 @@
 
   const ACT = {
     meal: d => sheetMeal(d),
-    dish: id => sheetDish(id, S.profiles.length),
+    dish: a => { const [id, date] = String(a).split('|'); const m = date ? mealForDate(date) : null; sheetDish(id, m ? C.dishScale(S, m) : 1); },
     close: () => hideSheet(),
     picker: d => sheetPicker(d),
     pickkind: k => { pickKind = k; sheetPicker(CURRENT_PICK); },
-    pick: a => { const [date, id] = a.split('|'); const d = DISH[id]; setMeal(date, { dishes: [id], status: 'cook', rice: riceFor(d.kind) }); hideSheet(); toast('已换成 ' + d.name); },
+    pick: a => {
+      const [date, id] = a.split('|'); const d = DISH[id];
+      setMeal(date, { dishes: [id], status: 'cook', rice: riceFor(d.kind) });
+      const m = mealForDate(date);
+      if (m && C.mealScale(S, m) >= 1.8) {
+        const add = secondDish(id, date);
+        if (add) { m.dishes.push(add.id); if (add.min > (m.min || 0)) m.min = add.min; }
+      }
+      save(); hideSheet(); toast('已换成 ' + d.name);
+    },
     out: d => { const m = mealForDate(d); setMeal(d, { status: m && m.status === 'out' ? 'cook' : 'out' }); hideSheet(); toast(m && m.status === 'out' ? '改回在家吃' : '这顿外食，食材留到下一顿'); },
     lock: d => { const m = mealForDate(d); setMeal(d, { locked: !(m && m.locked) }); hideSheet(); },
     rice: d => { const m = mealForDate(d); setMeal(d, { rice: ((m && m.rice) || 0) + 1 > 4 ? 0 : ((m && m.rice) || 0) + 1 }); sheetMeal(d); },
@@ -845,15 +925,23 @@
     libtab: k => { libTab = k; viewLib(); },
     newfresh: () => { newPage += 1; libQ = ''; viewLib(); try { window.scrollTo(0, 0); } catch (e) {} },
     hist: () => { histOpen = !histOpen; viewWeek(); },
-    eaters: d => {
-      const m = mealForDate(d) || mealAt(C.mondayOf(d), d);
+    eaters: d => sheetEaters(d),
+    etoggle: a => {
+      const [date, pid] = a.split('|');
+      const m = mealForDate(date) || mealAt(C.mondayOf(date), date);
       if (!m) return;
-      const ps = S.profiles || [{ id: 'p1' }];
-      const cur = (m.eaters && m.eaters.length) || S.settings.eatersDefault || 1;
-      const next = cur >= ps.length ? 1 : cur + 1;
-      m.eaters = ps.slice(0, next).map(p => p.id);
-      save(); sheetMeal(d);
-      toast(next === 1 ? '这顿按 1 人份算' : `这顿按 ${next} 人份算`);
+      const cur = C.mealEaters(S, m).slice();
+      const i = cur.indexOf(pid);
+      if (i >= 0) { if (cur.length === 1) return toast('至少留一个人吃饭'); cur.splice(i, 1); }
+      else cur.push(pid);
+      setEaters(date, cur);
+      sheetEaters(date);
+    },
+    equick: a => {
+      const [date, n] = a.split('|');
+      const ps = (S.profiles || []).slice(0, +n);
+      setEaters(date, ps.map(p => p.id));
+      sheetEaters(date);
     },
     editdish: id => sheetEditDish(id),
     savedish: id => {
@@ -963,6 +1051,11 @@
       Object.values(S.plans || {}).forEach(p => (p.days || []).forEach(m => {
         if (m.eaters) { m.eaters = m.eaters.filter(x => x !== gone.id); if (!m.eaters.length) delete m.eaters; }
       }));
+      /* 按日期记的那份也要清，不然重排又会把这个已经删掉的人贴回来 */
+      Object.keys(S.eatersByDate || {}).forEach(d => {
+        S.eatersByDate[d] = (S.eatersByDate[d] || []).filter(x => x !== gone.id);
+        if (!S.eatersByDate[d].length) delete S.eatersByDate[d];
+      });
       if ((S.settings.eatersDefault || 1) > S.profiles.length) S.settings.eatersDefault = S.profiles.length;
       save(); viewSet(); renderTop(); toast(`已删除 ${gone.name}`);
     },
@@ -1084,6 +1177,29 @@
       else if (ui.startsWith('edit:')) sheetEditDish(ui.slice(5));
       else if (ui.startsWith('lib:')) { S.tab = 'lib'; libTab = ui.slice(4) || 'mine'; render(); }
       else if (ui === 'addp') { S.profiles.push({ id: 'px' + Date.now(), name: '家人', portion: 1 }); S.tab = 'set'; save(); render(); }
+      else if (ui === 'two') {
+        /* 截图用：造一个"两个人吃"的场景 —— 家里两个人，明天和后天一起吃 */
+        if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });
+        const d1 = C.addD(today(), 1), d2 = C.addD(today(), 2);
+        const ids = S.profiles.slice(0, 2).map(p => p.id);
+        S.eatersByDate[d1] = ids; S.eatersByDate[d2] = ids;
+        [d1, d2].forEach(d => { const m = mealForDate(d); if (m) setEaters(d, ids); });
+        S.tab = 'week'; save(); render();
+      }
+      else if (ui.startsWith('eaters:')) sheetEaters(ui.slice(7));
+      else if (ui === 'twosheet') {        if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });
+        const d1 = C.addD(today(), 1);
+        const ids = S.profiles.slice(0, 2).map(p => p.id);
+        S.eatersByDate[d1] = ids; setEaters(d1, ids);
+        S.tab = 'week'; save(); render(); sheetEaters(d1);
+      }
+      else if (ui === 'twomeal') {
+        if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });
+        const d1 = C.addD(today(), 1);
+        const ids = S.profiles.slice(0, 2).map(p => p.id);
+        S.eatersByDate[d1] = ids; setEaters(d1, ids);
+        S.tab = 'week'; save(); render(); sheetMeal(d1);
+      }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
     }
