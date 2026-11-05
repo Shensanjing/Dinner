@@ -152,8 +152,9 @@
     const n = Math.max(1, ((m && m.dishes) || []).length);
     return Math.round((mealScale(state, m) / n) * 10) / 10;
   }
-  /* 一顿饭的总热量：菜（可能两道）+ 主食，乘以份数 */
+  /* 一顿饭的总热量：菜（可能两道）+ 主食，乘以份数；外食不算热量 */
   function mealKcal(state, m) {
+    if (!m || m.status === 'out') return 0;
     const kc = (m.dishes || []).reduce((a, id) => a + ((DISH[id] || {}).kcal || 0), 0);
     const riceK = m.rice ? stapleOf(state, m).kcalPerBowl * m.rice : 0;
     return Math.round(kc * dishScale(state, m) + riceK * mealScale(state, m));
@@ -432,6 +433,7 @@
   /* 这一顿要用的东西是不是全在库存里（用来判断"到货第 N 天"还有没有意义） */
   function mealInStock(state, m) {
     if (!m || !m.dishes || !m.dishes.length) return false;
+    if (m.status && m.status !== 'cook') return false;   // 外食/清空的天不谈库存
     const scale = dishScale(state, m);
     const onDate = m.date || todayStr();
     let any = false;
@@ -499,7 +501,7 @@
   function mealNeeds(state, meal) {
     const out = {};
     if (!meal) return out;
-    const eaters = (state.profiles || []).length || 1;
+    if (meal.status && meal.status !== 'cook') return out;   // 外食不用扣库存
     const scale = dishScale(state, meal);
     (meal.dishes || []).forEach(id => {
       const d = DISH[id]; if (!d) return;

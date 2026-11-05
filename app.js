@@ -596,13 +596,18 @@
     const who = (S.profiles || []).filter(p => eaters.indexOf(p.id) >= 0).map(p => p.name).join('、');
     showSheet(`
       <h2>${C.WEEK_CN[C.dow(date)]} ${+mo}月${+da}日</h2>
-      <div class="sheet-sub">${d ? ds.map(x => esc(x.name)).join(' ＋ ') + ' · ' + C.mealKcal(S, m) + ' kcal · ' + Math.max(...ds.map(x => x.min)) + ' 分钟' : (m.status === 'out' ? '外食' : '还没安排')}</div>
+      <div class="sheet-sub">${m.status === 'out' ? '外食（原来排的菜还留着，改回家吃会恢复）' : d ? ds.map(x => esc(x.name)).join(' ＋ ') + ' · ' + C.mealKcal(S, m) + ' kcal · ' + Math.max(...ds.map(x => x.min)) + ' 分钟' : '还没安排'}</div>
       ${ds.map((x, i) => `<div class="act-list">
-        <button class="act" data-act="dish" data-arg="${x.id}|${date}"><span class="em">📖</span>${ds.length > 1 ? '第 ' + (i + 1) + ' 道：' : ''}${esc(x.name)} 的食材 / 做法</button>
+        <button class="act" data-act="dish" data-arg="${x.id}|${date}"><span class="em">📖</span>${ds.length > 1 ? (i === 0 ? '主菜：' : '配菜：') : ''}${esc(x.name)} 的食材 / 做法</button>
+        <div class="row" style="gap:8px;padding:6px 2px 2px">
+          <button class="btn ghost" style="flex:1" data-act="pickslot" data-arg="${date}|${i}">换这${i === 0 ? '道主菜' : '道配菜'}</button>
+          <button class="btn ghost" style="flex:1" data-act="dishlock" data-arg="${date}|${x.id}">${(m.dishLocks || []).indexOf(x.id) >= 0 ? '🔒 已锁' : '锁定这道'}</button>
+        </div>
       </div>`).join('')}
       <div class="act-list">
-        <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '换一道' : '选一道菜'}</button>
-        <button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>
+        ${ds.length === 1 ? `<button class="act" data-act="addside" data-arg="${date}"><span class="em">➕</span>再加一道配菜</button>` : ''}
+        <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '两道一起换' : '选一道菜'}</button>
+        ${m.status === 'out' ? '' : `<button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>`}
         <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : (date === today() ? '今天出去吃' : '这天出去吃')}</button>
         <button class="act" data-act="lock" data-arg="${date}"><span class="em">🔒</span>${m.locked ? '解锁这顿' : '锁定这顿（重排时不动）'}</button>
         <button class="act" data-act="eaters" data-arg="${date}"><span class="em">👥</span>${who ? who + ' 吃' : '这顿谁吃'}（${eaters.length || 1} 人 · ${sc} 份，点一下改）</button>
@@ -755,11 +760,14 @@
   }
 
   let pickQ = '', pickKind = '';
+  let pickSlot = null;          // { date, idx } —— 只换某一道（0 = 主菜，1 = 配菜）
   function sheetPicker(date) {
     const cur = mealForDate(date);
     const list = Object.values(DISH).filter(d => !archIds().has(d.id)).filter(d =>
       (!pickKind || d.kind === pickKind) &&
       (!pickQ || d.name.includes(pickQ) || d.ing.some(i => i.name.includes(pickQ))));
+    const slotTxt = (pickSlot && pickSlot.date === date)
+      ? (pickSlot.idx === 0 ? '（只换主菜，配菜不动）' : '（只换配菜，主菜不动）') : '';
     const rows = list.slice(0, 60).map(d => {
       const b = C.batchesOf(S.weekStart)[C.batchIndexOf(S.weekStart, date)];
       const age = C.dspan(b.deliver, date);
@@ -770,7 +778,7 @@
         <span class="muted">${C.yuan(C.dishCost(d))}</span></div>`;
     }).join('');
     showSheet(`
-      <h2>换一道菜</h2>
+      <h2>换一道菜${slotTxt}</h2>
       <div class="sheet-sub">${date} · ${cur && cur.status === 'out' ? '当前是外食' : ''}</div>
       <input type="text" id="pickq" placeholder="搜菜名或食材" value="${esc(pickQ)}">
       <div class="chips" style="margin-top:10px">
@@ -871,20 +879,55 @@
     for (let i = 0; i <= 1; i++) weeks.push(C.mondayOf(C.addD(S.weekStart, i * 7)));
     weeks.forEach(ws => {
       const old = plan(ws);
-      const locked = old ? old.days.filter(m => m.locked && m.dishes.length) : [];
+      /* 锁定的整顿、外食、清空都要原样保留 —— 以前只留"有菜的"，外食+锁定一重排就变回一道菜 */
+      const locked = old ? old.days.filter(m => m.locked) : [];
       const np = applyEaters(C.generate(ws, S));
-      const usedByLocked = new Set(locked.map(m => m.dishes[0]));
+      const lockedDates = new Set(locked.map(m => m.date));
       locked.forEach(lm => {
         const slot = np.days.find(x => x.date === lm.date);
-        if (slot) { Object.assign(slot, lm); }
+        if (slot) {
+          slot.dishes = (lm.dishes || []).slice();
+          slot.status = lm.status || (slot.dishes.length ? 'cook' : 'empty');
+          slot.locked = true;
+          slot.rice = lm.rice || 0;
+          slot.staple = lm.staple;
+          slot.dishLocks = (lm.dishLocks || []).slice();
+          slot.done = !!lm.done;
+          if (slot.dishes.length) {
+            const d0 = DISH[slot.dishes[0]];
+            if (d0) { slot.kind = d0.kind; slot.min = d0.min; slot.protein = C.mainProtein(d0); }
+          }
+        }
       });
+      /* 只锁了某一道的那些天：留下来的那几道不动，缺的位置补一道互补的 */
       np.days.forEach(m => {
-        if (locked.some(l => l.date === m.date)) return;
+        if (lockedDates.has(m.date)) return;
+        const om = old && old.days.find(x => x.date === m.date);
+        const locks = (om && om.dishLocks) || [];
+        if (!locks.length) return;
+        const need = (C.mealScale(S, m) >= 1.8 ? 2 : 1);
+        /* 锁住的那道必须留着，缺的位置再补一道互补的 */
+        const want = locks.filter(id => DISH[id]);
+        while (want.length < need) {
+          const add = secondDish(want[0] || m.dishes[0], m.date);
+          if (!add || want.indexOf(add.id) >= 0) break;
+          want.push(add.id);
+        }
+        m.dishes = want.slice(0, Math.max(need, want.length));
+        m.dishLocks = locks.slice();
+        if (want.length) { const d0 = DISH[want[0]]; if (d0) { m.kind = d0.kind; m.min = d0.min; m.protein = C.mainProtein(d0); } }
+      });
+      const usedByLocked = new Set();
+      np.days.forEach(m => { if (lockedDates.has(m.date)) (m.dishes || []).forEach(id => usedByLocked.add(id)); });
+      np.days.forEach(m => {
+        if (lockedDates.has(m.date)) return;
+        if (m.status !== 'cook' || !m.dishes.length) return;
         if (usedByLocked.has(m.dishes[0])) {
           const alt = Object.values(DISH).filter(d => !usedByLocked.has(d.id) && d.min <= (C.dow(m.date) % 6 === 0 ? S.settings.weekendMax : S.settings.weekdayMax));
           if (alt.length) { m.dishes = [alt[Math.floor(Math.random() * alt.length)].id]; const d = DISH[m.dishes[0]]; m.protein = C.mainProtein(d); m.rice = riceFor(d.kind); }
         }
       });
+      /* 外食那天不参与采购/库存，菜只是"留着备用" */
       S.plans[ws] = np;
     });
     save(); render();
@@ -895,10 +938,49 @@
     meal: d => sheetMeal(d),
     dish: a => { const [id, date] = String(a).split('|'); const m = date ? mealForDate(date) : null; sheetDish(id, m ? C.dishScale(S, m) : 1); },
     close: () => hideSheet(),
-    picker: d => sheetPicker(d),
+    picker: d => { pickSlot = null; sheetPicker(d); },
     pickkind: k => { pickKind = k; sheetPicker(CURRENT_PICK); },
+    /* 只换某一道：idx 0 = 主菜，1 = 配菜，另一道不动 */
+    pickslot: a => { const [date, idx] = String(a).split('|'); pickSlot = { date, idx: +idx }; pickKind = ''; pickQ = ''; sheetPicker(date); },
+    /* 单独锁一道菜：重排时这道保留，另一道还可以换 */
+    dishlock: a => {
+      const [date, id] = String(a).split('|');
+      const m = mealForDate(date); if (!m) return;
+      const locks = (m.dishLocks || []).slice();
+      const i = locks.indexOf(id);
+      if (i >= 0) locks.splice(i, 1); else locks.push(id);
+      m.dishLocks = locks;
+      save(); sheetMeal(date);
+      toast(i >= 0 ? '这道解锁了' : '这道锁住了，重排时不会动');
+    },
+    addside: d => {
+      const m = mealForDate(d); if (!m || !m.dishes.length) return;
+      const add = secondDish(m.dishes[0], d);
+      if (!add) return toast('没有合适的配菜了');
+      m.dishes.push(add.id);
+      if (add.min > (m.min || 0)) m.min = add.min;
+      save(); sheetMeal(d);
+      toast('加了一道 ' + add.name);
+    },
     pick: a => {
       const [date, id] = a.split('|'); const d = DISH[id];
+      const m0 = mealForDate(date);
+      if (pickSlot && pickSlot.date === date) {
+        /* 只替换那一道，另一道原样留着 */
+        const idx = pickSlot.idx;
+        const cur = ((m0 && m0.dishes) || []).slice();
+        const oldId = cur[idx];
+        if (idx < cur.length) cur[idx] = id; else cur.push(id);
+        const dishIds = cur.slice(0, 2);
+        pickSlot = null;
+        setMeal(date, { dishes: dishIds, status: 'cook' });
+        const m1 = mealForDate(date);
+        /* 被换掉的那道如果原来锁着，锁跟着作废；另一道的锁留着 */
+        if (m1 && m1.dishLocks && oldId) m1.dishLocks = m1.dishLocks.filter(x => x !== oldId);
+        save(); hideSheet(); sheetMeal(date);
+        toast('换好了：' + dishIds.map(x => (DISH[x] || {}).name).filter(Boolean).join(' ＋ '));
+        return;
+      }
       setMeal(date, { dishes: [id], status: 'cook', rice: riceFor(d.kind) });
       const m = mealForDate(date);
       if (m && C.mealScale(S, m) >= 1.8) {
@@ -907,7 +989,13 @@
       }
       save(); hideSheet(); toast('已换成 ' + d.name);
     },
-    out: d => { const m = mealForDate(d); setMeal(d, { status: m && m.status === 'out' ? 'cook' : 'out' }); hideSheet(); toast(m && m.status === 'out' ? '改回在家吃' : '这顿外食，食材留到下一顿'); },
+    out: d => {
+      const m = mealForDate(d);
+      const to = m && m.status === 'out' ? 'cook' : 'out';
+      setMeal(d, { status: to });
+      hideSheet();
+      toast(to === 'out' ? '这顿外食（菜还留着，改回来就恢复）' : '改回在家吃');
+    },
     lock: d => { const m = mealForDate(d); setMeal(d, { locked: !(m && m.locked) }); hideSheet(); },
     rice: d => { const m = mealForDate(d); setMeal(d, { rice: ((m && m.rice) || 0) + 1 > 4 ? 0 : ((m && m.rice) || 0) + 1 }); sheetMeal(d); },
     staple: d => {
