@@ -32,6 +32,12 @@
     tofu_soft: '豆', tofu_firm: '豆', tofu_dry: '豆'
   };
   const FROZEN_CATS = ['肉禽蛋', '水产'];
+  /* 家里有同类别的肉就能顶：牛肉末这种"顺手切一点"的，用牛肋条/牛腩顶上完全没问题，
+     不然会为了 50g 肉末去买一整包牛里脊。只收窄到"同一个大类、能切能剁"的配对。 */
+  const SUBST = {
+    beef: ['beef_rib'],
+    beef_rib: ['beef']
+  };
 
   function mainProtein(d) {
     let best = null, g = -1;
@@ -620,7 +626,7 @@
       b: i, order: w.deliver, deliver: w.deliver, days: w.days,
       name: (w.deliver === today ? '今天 ' : WEEK_CN[dow(w.deliver)] + ' ') + md(w.deliver),
       note: w.days.length > 1 ? `送 ${md(w.deliver)}–${md(w.days[w.days.length - 1])}` : `送 ${md(w.deliver)}`,
-      items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, covers: []
+      items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, uses: {}, covers: []
     }));
     const eaters = (state.profiles || []).length || 1;
 
@@ -641,6 +647,10 @@
             const grams = x.g * scale;
             if (x.opt) { b.optSet = b.optSet || {}; b.optSet[x.key] = (b.optSet[x.key] || 0) + grams; return; }
             b.needs[x.key] = (b.needs[x.key] || 0) + grams;
+            /* 记下"这 50g 是哪道菜要的"，采购行展开就能看到 */
+            const use = (b.uses[x.key] = b.uses[x.key] || []);
+            const hit = use.find(u => u.name === d.name);
+            if (hit) hit.g += grams; else use.push({ name: d.name, g: grams });
           });
           /* 调料：永远不进购物车，只看要不要提醒补货 */
           (d.season || []).forEach(x => {
@@ -652,7 +662,12 @@
         });
         if (m.rice) {
           const st = stapleOf(state, m);
-          b.needs[st.key] = (b.needs[st.key] || 0) + m.rice * st.rawPerBowl * mealScale(state, m);
+          const g = m.rice * st.rawPerBowl * mealScale(state, m);
+          b.needs[st.key] = (b.needs[st.key] || 0) + g;
+          const use = (b.uses[st.key] = b.uses[st.key] || []);
+          const nm = st.name + ' ' + m.rice + ' 碗';
+          const hit = use.find(u => u.name === nm);
+          if (hit) hit.g += g; else use.push({ name: nm, g });
         }
       }
     });
@@ -683,18 +698,31 @@
         }
         const sku = skuOf(key, state);
         if (!sku || !sku.specG) { b.have.push({ key, name: it.name, g: Math.round(need), note: '自备' }); return; }
-        const fromInv = stockLeft[key] || 0;
+        /* 同类食材可以互相顶：牛肉末没了用牛肋条、里脊没了用肋条（反向也行） */
+        const fam = [key].concat(SUBST[key] || []);
+        let fromInv = 0;
+        fam.forEach(k => { fromInv += (stockLeft[k] || 0); });
         const carry = leftover[key] || 0;
         const avail = fromInv + carry;
         const net = need - avail;
         if (net <= 0) {
           const useInv = Math.min(fromInv, need);
-          stockLeft[key] = fromInv - useInv;
-          b.have.push({ key, name: it.name, g: Math.round(need), note: carry > 0 ? '上一单剩的' : '库存够' });
+          /* 先扣本尊，不够再从替代品扣，并记下到底是哪个顶上的 */
+          let left = useInv, subUsed = '';
+          fam.forEach(k => {
+            const take = Math.min(stockLeft[k] || 0, left);
+            if (take > 0) {
+              stockLeft[k] = (stockLeft[k] || 0) - take;
+              left -= take;
+              if (k !== key) subUsed = (ING[k] || {}).name || k;
+            }
+          });
+          const note = carry > 0 ? '上一单剩的' : (subUsed ? '库存够 · 用' + subUsed + '顶' : '库存够');
+          b.have.push({ key, name: it.name, g: Math.round(need), note });
           if (carry > 0) leftover[key] = Math.max(0, carry - Math.max(0, need - useInv));
           return;
         }
-        stockLeft[key] = 0;
+        fam.forEach(k => { stockLeft[k] = 0; });
         const packs = Math.max(1, Math.ceil(net / sku.specG));
         const gain = packs * sku.specG;
         const rest = gain - net;
@@ -703,6 +731,7 @@
           key, name: it.name, sku: sku.name, spec: sku.spec, specG: sku.specG,
           packs, price: Math.round(sku.price * packs * 100) / 100, unit: sku.price,
           need: Math.round(net), gross: Math.round(need), share: net / gain, real: sku.real, cat: it.cat,
+          uses: (b.uses[key] || []).map(u => ({ name: u.name, g: Math.round(u.g) })),
           carry: carry > 0 ? Math.round(carry) : 0, rest: Math.round(rest)
         });
       });
@@ -714,6 +743,10 @@
         hit.packs += x.packs; hit.need += x.need; hit.gross += x.gross;
         hit.rest += x.rest; hit.carry = Math.max(hit.carry, x.carry);
         hit.share = Math.min(hit.share, x.share);
+        (x.uses || []).forEach(u => {
+          const f = hit.uses.find(y => y.name === u.name);
+          if (f) f.g += u.g; else hit.uses.push({ name: u.name, g: u.g });
+        });
       });
       b.items = [...bySku.values()];
       b.total = b.items.reduce((a, x) => a + x.unit * x.packs, 0);
@@ -735,10 +768,15 @@
 
     /* 提前买：后面的单里"放得住"的东西，挪到前面这单来，好凑满 ¥39 起送。
        只是把下单时机提前，总花销不变；放不到那天的（叶菜、鲜鱼、豆腐）不挪。 */
-    const canEarly = (key, gap) => {
+    const canEarly = (x, gap) => {
+      const key = x.key;
       const it = ING[key]; if (!it) return false;
       const keep = keepDays(key);
       if (keep < gap + 2) return false;
+      /* 一大包只用一点点、又挺贵的东西，别为了凑单提前买回家占冰箱 */
+      const packPay = x.unit * x.packs;
+      if (x.share < 0.25 && packPay >= 15) return false;
+      if (packPay > Math.max(gap * 3, 30)) return false;
       if (FROZEN_CATS.indexOf(it.cat) >= 0) return true;         // 肉可以买回来就冻
       return ['蔬菜', '主食', '菌菇', '水果', '干货'].indexOf(it.cat) >= 0 && keep >= 7;
     };
@@ -757,7 +795,7 @@
         const nb = out[j];
         if (!nb.items.length) continue;
         const gap = Math.max(1, dspan(b.deliver, nb.deliver));
-        const move = nb.items.filter(x => canEarly(x.key, gap));
+        const move = nb.items.filter(x => canEarly(x, gap));
         if (!move.length) continue;
         const moved = [];
         move.forEach(x => {

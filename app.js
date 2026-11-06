@@ -273,12 +273,48 @@
       if (ageMap[date] != null) m.age = ageMap[date];
       html += mealCard(m);
     });
-    html += `<div class="muted center" style="margin:14px 0 6px">点任意一天可换菜 / 外食 / 改人数 / 锁定</div>`;
+    html += `<div class="muted center" style="margin:14px 0 6px">点一下改这顿 · <b>左滑锁定</b> · <b>长按解锁</b></div>`;
     $('#view').innerHTML = html;
+    bindCardGestures();
+  }
+
+  /* 列表上的手势：左滑 = 锁定这顿，长按 = 解锁。做完把紧接着的那次点击吃掉，免得顺带打开抽屉 */
+  let gestureAt = 0;
+  function setLock(date, on) {
+    const m = mealForDate(date); if (!m) return;
+    m.locked = on; gestureAt = Date.now(); save(); render();
+    toast(on ? '已锁定这顿（重排不会动它）' : '已解锁这顿');
+  }
+  function bindCardGestures() {
+    const cards = document.querySelectorAll ? document.querySelectorAll('.day-card[data-arg]') : [];
+    if (!cards || !cards.forEach) return;
+    cards.forEach(card => {
+      const date = card.dataset.arg;
+      let x0 = 0, y0 = 0, moved = false, timer = null;
+      const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+      card.addEventListener('touchstart', e => {
+        const t = e.touches[0]; x0 = t.clientX; y0 = t.clientY; moved = false;
+        stop();
+        timer = setTimeout(() => { timer = null; if (!moved) setLock(date, false); }, 560);
+      }, { passive: true });
+      card.addEventListener('touchmove', e => {
+        const t = e.touches[0];
+        if (Math.abs(t.clientX - x0) > 10 || Math.abs(t.clientY - y0) > 10) moved = true;
+        if (Math.abs(t.clientY - y0) > 16) stop();
+      }, { passive: true });
+      card.addEventListener('touchend', e => {
+        stop();
+        const t = e.changedTouches && e.changedTouches[0]; if (!t) return;
+        const dx = t.clientX - x0, dy = t.clientY - y0;
+        if (dx < -50 && Math.abs(dy) < 40) setLock(date, true);
+      }, { passive: true });
+      card.addEventListener('touchcancel', stop, { passive: true });
+    });
   }
 
   /* ---------------- 采购 ---------------- */
   let shopBatch = -1;                     // -1 = 自动选"还没下单的那一单"
+  const usesOpen = {};                    // 采购行展开「哪道菜用了它」
   /* 默认停在"还没下单的那一单"，别一进来就是一车过去的菜 */
   function firstOpenBatch() {
     const sh = C.shopping(S.weekStart, S);
@@ -304,11 +340,18 @@
       const pack = x.rest >= x.specG * 0.45
         ? `<span class="badge warn">整包 ${x.specG}g · 剩 ${x.rest}g</span>` : '';
       const early = x.early ? `<span class="badge ok">提前到这一单</span>` : '';
-      return `<div class="item ${on ? 'done' : ''}" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>
-        <div class="cb ${on ? 'on' : ''}">✓</div>
-        <div style="flex:1;min-width:0">
+      const us = x.uses || [];
+      const ukey = bi + ':' + x.key;
+      const uOpen = !!usesOpen[ukey];
+      const uSum = us.map(u => u.name).join('、');
+      return `<div class="item ${on ? 'done' : ''}">
+        <div class="cb ${on ? 'on' : ''}" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>✓</div>
+        <div style="flex:1;min-width:0" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>
           <div class="nm">${esc(x.name)} ×${x.packs} ${pack}${early}</div>
           <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}${x.early ? ` · 本来在「${esc(x.early)}」` : ''}</div>
+          ${us.length ? `<div class="uses"><span class="link" data-act="uses" data-arg="${ukey}">${uOpen ? '收起' : '用在 ' + us.length + ' 道菜'}</span>
+            ${uOpen ? `<div class="use-list">${us.map(u => `<div class="row" style="padding:2px 0"><span>${esc(u.name)}</span><span class="sp"></span><span class="muted">${u.g}g</span></div>`).join('')}</div>`
+                    : `<span class="muted" style="margin-left:8px">${esc(uSum.length > 24 ? uSum.slice(0, 24) + '…' : uSum)}</span>`}</div>` : ''}
         </div>
         <div class="pr">${C.yuan(x.unit * x.packs)}</div></div>`;
     }).join('');
@@ -365,6 +408,7 @@
         <div class="muted" style="margin-top:6px;border-top:1px dashed var(--line);padding-top:6px">
           全加 ¥${fSum.toFixed(2)} → 合计 ${C.yuan(fAll)}${fAll >= 39 ? '，免运费' : `，仍差 ${C.yuan(39 - fAll)}`}</div></div>` : ''}
       <div class="sec-title">要买 ${b.items.length} 样${past ? '（当时）' : ''}</div>
+      ${past ? '' : `<div class="muted" style="margin:-4px 2px 8px">前面的方框是你在七鲜逛的时候自己勾的记号，勾上只是把这一行划掉，不改金额、也不代表已经入库——入库要点下面的「这单买了」。</div>`}
       <div class="card">${items || '<div class="muted">这一单不用买生鲜</div>'}</div>
       ${b.opt.length ? `<div class="sec-title">可选加的</div><div class="card" style="padding:8px 14px">
         ${b.opt.map(x => `<div class="row" style="padding:4px 0"><span class="muted">${esc(x.name)}</span><span class="sp"></span><span class="muted">${x.g}g</span></div>`).join('')}</div>` : ''}
@@ -528,6 +572,18 @@
           <span class="muted" style="white-space:nowrap">≈ ${Math.round(s.riceGrams / C.STAPLE[s.staple || 'brown'].rawPerBowl * 10) / 10} 碗${C.STAPLE[s.staple || 'brown'].name}</span>
         </div>
         <div class="muted" style="margin-bottom:10px">1 碗熟饭按 150g 算：白米约 50g 生米、糙米约 48g（糙米蒸的时候吸水更多）。</div>
+        <label class="fld">同样这些米，煮熟后称出来多少克（可留空）</label>
+        <div class="row" style="gap:8px">
+          <input type="number" value="${s.cookedGrams || ''}" placeholder="比如 356" data-act="setcooked" style="flex:1">
+          <span class="muted" style="white-space:nowrap">克熟饭</span>
+        </div>
+        <div class="muted" style="margin-bottom:10px">${(() => {
+          const raw = +s.riceGrams || 0, cook = +s.cookedGrams || 0;
+          if (!raw || !cook) return '填了以后能算出你自己的吸水倍率，还有你那只碗到底多大。';
+          const ratio = Math.round(cook / raw * 100) / 100;
+          const bowl = Math.round(cook / (raw / C.STAPLE[s.staple || 'brown'].rawPerBowl));
+          return `吸水 ${ratio} 倍（${raw}g 生米 → ${cook}g 熟饭）；按你的饭量算，一碗熟饭大约 ${bowl}g。热量仍按生米算，不受影响。`;
+        })()}</div>
       </div>
       <div class="sec-title">价格</div>
       <div class="card">
@@ -553,6 +609,7 @@
     document.querySelectorAll('[data-act=pportion]').forEach(el => el.onchange = e => { S.profiles[+el.dataset.arg].portion = +e.target.value; save(); });
     document.querySelectorAll('[data-act=setnum]').forEach(el => el.onchange = e => { S.settings[el.dataset.arg] = +e.target.value; save(); });
     document.querySelectorAll('[data-act=setrice]').forEach(el => el.onchange = e => ACT.setrice(e.target.value));
+    document.querySelectorAll('[data-act=setcooked]').forEach(el => el.onchange = e => ACT.setcooked(e.target.value));
   }
 
   /* ---------------- 渲染 ---------------- */
@@ -761,7 +818,10 @@
 
   let pickQ = '', pickKind = '';
   let pickSlot = null;          // { date, idx } —— 只换某一道（0 = 主菜，1 = 配菜）
+  let pickDate = null;          // 面板当前是哪天：分类/搜索重绘时要靠它，不能依赖别处传参
   function sheetPicker(date) {
+    if (date) pickDate = date;
+    date = pickDate;
     const cur = mealForDate(date);
     const list = Object.values(DISH).filter(d => !archIds().has(d.id)).filter(d =>
       (!pickKind || d.kind === pickKind) &&
@@ -939,7 +999,7 @@
     dish: a => { const [id, date] = String(a).split('|'); const m = date ? mealForDate(date) : null; sheetDish(id, m ? C.dishScale(S, m) : 1); },
     close: () => hideSheet(),
     picker: d => { pickSlot = null; sheetPicker(d); },
-    pickkind: k => { pickKind = k; sheetPicker(CURRENT_PICK); },
+    pickkind: k => { pickKind = k; sheetPicker(pickDate); },
     /* 只换某一道：idx 0 = 主菜，1 = 配菜，另一道不动 */
     pickslot: a => { const [date, idx] = String(a).split('|'); pickSlot = { date, idx: +idx }; pickKind = ''; pickQ = ''; sheetPicker(date); },
     /* 单独锁一道菜：重排时这道保留，另一道还可以换 */
@@ -1008,6 +1068,7 @@
     clear: d => { setMeal(d, { dishes: [], status: 'empty', rice: 0 }); hideSheet(); },
     regen: () => { if (plan(S.weekStart) && !confirm('重新排会覆盖没锁定的安排，继续？')) return; regenerate(); },
     batch: i => { shopBatch = +i; viewShop(); },
+    uses: a => { usesOpen[a] = !usesOpen[a]; viewShop(); },
     chk: a => { const [bi, key] = a.split(':'); const k = S.weekStart + ':' + bi; S.checked[k] = S.checked[k] || {}; S.checked[k][key] = !S.checked[k][key]; save(); viewShop(); },
     libkind: k => { libKind = k; viewLib(); },
     libtab: k => { libTab = k; viewLib(); },
@@ -1125,6 +1186,12 @@
     },
     resetprice: () => { S.priceFactor = 1; S.paid = {}; save(); viewShop(); toast('已恢复七鲜标价'); },
     setrice: v => { S.settings.riceGrams = Math.max(30, Math.min(500, +v || 130)); save(); viewSet(); },
+    setcooked: v => {
+      const n = +v;
+      if (!v || !(n > 0)) delete S.settings.cookedGrams;
+      else S.settings.cookedGrams = Math.max(50, Math.min(2000, Math.round(n)));
+      save(); viewSet();
+    },
     setmeat: n => { S.settings.meatPerWeek = +n; save(); viewSet(); },
     shopmode: m => { S.settings.shopMode = m === 'week' ? 'week' : 'auto'; shopBatch = 0; save(); viewSet(); },
     setstaple: k => { S.settings.staple = k; save(); viewSet(); },
@@ -1234,11 +1301,13 @@
   }
 
   document.addEventListener('click', e => {
+    if (Date.now() - gestureAt < 450) { gestureAt = 0; return; }   // 刚左滑/长按过，这次点击不算
     const el = e.target.closest('[data-act]');
     if (!el || !ACT[el.dataset.act]) return;
+    /* 输入框/下拉框靠 onchange 走，别在点击时把它们当成动作触发（否则点一下就被重置） */
+    if (el.matches('input, select, textarea')) return;
     const a = el.dataset.act;
     if (a === 'picker') CURRENT_PICK = el.dataset.arg;
-    if (a === 'pickkind') CURRENT_PICK = CURRENT_PICK || null;
     ACT[a](el.dataset.arg);
   });
   document.querySelectorAll('#tabbar button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; if (S.tab === 'shop') shopBatch = -1; save(); render(); window.scrollTo(0, 0); });
@@ -1275,7 +1344,8 @@
         S.tab = 'week'; save(); render();
       }
       else if (ui.startsWith('eaters:')) sheetEaters(ui.slice(7));
-      else if (ui === 'twosheet') {        if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });
+      else if (ui === 'twosheet') {
+        if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });
         const d1 = C.addD(today(), 1);
         const ids = S.profiles.slice(0, 2).map(p => p.id);
         S.eatersByDate[d1] = ids; setEaters(d1, ids);
@@ -1287,6 +1357,14 @@
         const ids = S.profiles.slice(0, 2).map(p => p.id);
         S.eatersByDate[d1] = ids; setEaters(d1, ids);
         S.tab = 'week'; save(); render(); sheetMeal(d1);
+      }
+      else if (ui === 'uses') {
+        /* 截图用：把第一张单里所有"用在几道菜"都展开 */
+        S.tab = 'shop'; shopBatch = -1; render();
+        const sh0 = C.shopping(S.weekStart, S);
+        const bi0 = Math.min(Math.max(shopBatch, 0), sh0.batches.length - 1);
+        (sh0.batches[bi0].items || []).forEach(x => { usesOpen[bi0 + ':' + x.key] = true; });
+        viewShop();
       }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
