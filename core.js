@@ -626,7 +626,7 @@
       b: i, order: w.deliver, deliver: w.deliver, days: w.days,
       name: (w.deliver === today ? '今天 ' : WEEK_CN[dow(w.deliver)] + ' ') + md(w.deliver),
       note: w.days.length > 1 ? `送 ${md(w.deliver)}–${md(w.days[w.days.length - 1])}` : `送 ${md(w.deliver)}`,
-      items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, uses: {}, covers: []
+      items: [], opt: [], have: [], carry: [], restock: [], total: 0, needs: {}, uses: {}, covers: [], needByDay: {}
     }));
     const eaters = (state.profiles || []).length || 1;
 
@@ -639,6 +639,7 @@
         const m = (pl.days || []).find(x => x.date === dt0);
         if (!m || m.status !== 'cook' || !m.dishes || !m.dishes.length) continue;
         b.covers.push({ date: dt0, name: m.dishes.map(id => (DISH[id] || {}).name).filter(Boolean).join(' + '), week: pw === ws ? 'this' : 'adj' });
+        const nb = (b.needByDay[dt0] = b.needByDay[dt0] || {});   // 这一天的用量，用来算"最早能哪天到货"
         m.dishes.forEach(id => {
           const d = DISH[id]; if (!d) return;
           const scale = dishScale(state, m);
@@ -647,6 +648,7 @@
             const grams = x.g * scale;
             if (x.opt) { b.optSet = b.optSet || {}; b.optSet[x.key] = (b.optSet[x.key] || 0) + grams; return; }
             b.needs[x.key] = (b.needs[x.key] || 0) + grams;
+            nb[x.key] = (nb[x.key] || 0) + grams;
             /* 记下"这 50g 是哪道菜要的"，采购行展开就能看到 */
             const use = (b.uses[x.key] = b.uses[x.key] || []);
             const hit = use.find(u => u.name === d.name);
@@ -664,6 +666,7 @@
           const st = stapleOf(state, m);
           const g = m.rice * st.rawPerBowl * mealScale(state, m);
           b.needs[st.key] = (b.needs[st.key] || 0) + g;
+          nb[st.key] = (nb[st.key] || 0) + g;
           const use = (b.uses[st.key] = b.uses[st.key] || []);
           const nm = st.name + ' ' + m.rice + ' 碗';
           const hit = use.find(u => u.name === nm);
@@ -681,6 +684,7 @@
     const isOrdered = d => !!((state.ordered || {})[d]);
     let prevOrdered = false;
     out.forEach(b => {
+      const stock0 = Object.assign({}, stockLeft);   // 这一单开始前的库存快照，用来算"能不能晚点再买"
       Object.keys(b.needs).forEach(key => {
         const it = ING[key]; if (!it) return;
         const need = b.needs[key];
@@ -750,6 +754,38 @@
       });
       b.items = [...bySku.values()];
       b.total = b.items.reduce((a, x) => a + x.unit * x.packs, 0);
+      /* 下单日往后挪：前面几天靠库存就够的话，没必要提前一天把菜买回来放着 */
+      if (b.items.length && b.needByDay) {
+        const bought = {};
+        b.items.forEach(x => { bought[x.key] = (bought[x.key] || 0) + x.need; });
+        let best = b.deliver;
+        for (const cand of b.days) {
+          if (cand < b.deliver) continue;
+          const avail = Object.assign({}, stock0);
+          let ok = true, arrived = false;
+          for (const d of b.days) {
+            if (!arrived && d >= cand) {
+              Object.keys(bought).forEach(k => { avail[k] = (avail[k] || 0) + bought[k]; });
+              arrived = true;
+            }
+            const nd = b.needByDay[d] || {};
+            for (const k of Object.keys(nd)) {
+              /* 常备/自备的（米面调料）不看库存，只看"这单要不要为它跑一趟" */
+              if (!bought[k] && !((avail[k] || 0) > 0)) continue;
+              if ((avail[k] || 0) + 0.01 < nd[k]) { ok = false; break; }
+            }
+            if (!ok) break;
+            Object.keys(nd).forEach(k => { avail[k] = (avail[k] || 0) - nd[k]; });
+          }
+          if (ok) best = cand;
+        }
+        if (best > b.deliver) {
+          b.deliver0 = b.deliver;
+          b.deliver = best;
+          b.name = (best === today ? '今天 ' : WEEK_CN[dow(best)] + ' ') + md(best);
+          b.note = b.days.length > 1 ? `送 ${md(best)}–${md(b.days[b.days.length - 1])}` : `送 ${md(best)}`;
+        }
+      }
       if (b.items.some(x => x.carry > 0)) b.carry = b.items.filter(x => x.carry > 0);
       const order = ['肉禽蛋', '水产', '蔬菜', '菌菇', '豆制品', '水果', '主食', '乳品'];
       b.items.sort((x, y) => (order.indexOf(x.cat) - order.indexOf(y.cat)) || (y.price - x.price));

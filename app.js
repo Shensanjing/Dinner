@@ -173,13 +173,12 @@
     const p = plan(C.mondayOf(date));
     return p ? p.days.find(m => m.date === date) || null : null;
   }
-  /* 往后补排：缺哪周就排哪周，已锁定的不动；已经过去的那几周不补 */
-  function ensureAhead(weeks) {
+  /* 往后补排：把"今天起 14 天"跨到的每一周都排上（最多 3 周）；已经过去的周不补 */
+  function ensureAhead() {
     let changed = false;
     const cur = C.mondayOf(today());
-    for (let i = 0; i <= weeks; i++) {
-      const ws = C.mondayOf(C.addD(S.weekStart, i * 7));
-      if (ws < cur) continue;
+    const last = C.mondayOf(C.addD(today(), 13));   // 14 天窗口的最后一格
+    for (let ws = cur; ws <= last; ws = C.addD(ws, 7)) {
       if (!S.plans[ws]) { S.plans[ws] = applyEaters(C.generate(ws, S)); changed = true; }
     }
     if (changed) save();
@@ -236,7 +235,7 @@
   }
   let histOpen = false;
   function viewWeek() {
-    ensureAhead(1);                       // 今天这周 + 下一周，滚动就是连续的
+    ensureAhead();                        // 今天起 14 天跨到的周都排上，滚动就是连续的
     const days = [];
     for (let i = 0; i < 14; i++) days.push(C.addD(today(), i));
     const hist = pastStats(14);
@@ -625,7 +624,7 @@
     /* 换天了才重新对到本周一：平时保留用户自己点左右翻出来的那一周 */
     const t = today();
     if (S.day0 !== t) { S.day0 = t; S.weekStart = C.mondayOf(t); }
-    if (S.tab === 'week' || S.tab === 'shop') ensureAhead(1);
+    if (S.tab === 'week' || S.tab === 'shop') ensureAhead();
     if (syncHistory()) save();
     renderTop();
     ({ week: viewWeek, shop: viewShop, lib: viewLib, inv: viewInv, set: viewSet }[S.tab] || viewWeek)();
@@ -663,7 +662,7 @@
       </div>`).join('')}
       <div class="act-list">
         ${ds.length === 1 ? `<button class="act" data-act="addside" data-arg="${date}"><span class="em">➕</span>再加一道配菜</button>` : ''}
-        <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${d ? '两道一起换' : '选一道菜'}</button>
+        <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${ds.length > 1 ? '两道一起换' : (d ? '换掉这道菜（重新挑一道）' : '选一道菜')}</button>
         ${m.status === 'out' ? '' : `<button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>`}
         <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : (date === today() ? '今天出去吃' : '这天出去吃')}</button>
         <button class="act" data-act="lock" data-arg="${date}"><span class="em">🔒</span>${m.locked ? '解锁这顿' : '锁定这顿（重排时不动）'}</button>
@@ -935,8 +934,13 @@
   }
 
   function regenerate() {
+    /* 重排的范围＝"今天起 14 天"跨到的所有周（最多 3 周）；翻到更远时就排翻到的那周 */
+    const cur = C.mondayOf(today());
+    const lastWin = C.mondayOf(C.addD(today(), 13));
+    const from = S.weekStart > cur ? S.weekStart : cur;
     const weeks = [];
-    for (let i = 0; i <= 1; i++) weeks.push(C.mondayOf(C.addD(S.weekStart, i * 7)));
+    for (let ws = from; ws <= lastWin; ws = C.addD(ws, 7)) weeks.push(ws);
+    if (!weeks.length) weeks.push(S.weekStart);
     weeks.forEach(ws => {
       const old = plan(ws);
       /* 锁定的整顿、外食、清空都要原样保留 —— 以前只留"有菜的"，外食+锁定一重排就变回一道菜 */
