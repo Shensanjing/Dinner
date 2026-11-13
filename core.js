@@ -917,7 +917,19 @@
       retotal(b);
       b.earlyCount = b.items.filter(x => x.early).length;
     }
-    return { ws, batches: out.filter(b => b.items.length || b.have.length) };
+    /* 用户在采购页手动"划掉"的行：按这一单的送达日记，跨批次重算也不丢 */
+    out.forEach(b => {
+      const drop = ((state.dropped || {})[b.deliver]) || null;
+      if (drop && Object.keys(drop).length) {
+        const gone = b.items.filter(x => drop[x.key]);
+        if (gone.length) {
+          b.items = b.items.filter(x => !drop[x.key]);
+          b.dropped = gone.map(x => ({ key: x.key, sku: x.sku, packs: x.packs, price: x.price }));
+          retotal(b);
+        }
+      }
+    });
+    return { ws, batches: out.filter(b => b.items.length || b.have.length || b.dropped) };
   }
 
   /* 凑单建议：只推耐放的 */

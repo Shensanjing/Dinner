@@ -1,7 +1,7 @@
 /* 今晚吃什么 —— service worker
    策略：同源请求 network-first，断网/超时回落到缓存；安装时预缓存整个壳。
    每次发布把 VERSION 改一下即可让旧缓存失效。 */
-const VERSION = '202611111224';
+const VERSION = '202611130600';
 const CACHE = 'dinner-' + VERSION;
 const SHELL = [
   './',

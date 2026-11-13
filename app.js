@@ -27,9 +27,10 @@
     profiles: [{ id: 'p1', name: '我', portion: 1 }],
     settings: {
       weekdayMax: 40, weekendMax: 60, riceGrams: 130, spicyNights: 3,
-      meatPerWeek: 3, staple: 'brown', eatersDefault: 1
+      meatPerWeek: 3, staple: 'brown', eatersDefault: 1, autoExec: 'auto'
     },
-    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {}, eatersByDate: {}
+    skuOverride: {}, checked: {}, batch: 0, seen: false, priceFactor: 1, paid: {}, ordered: {},
+    eatersByDate: {}, dropped: {}, buyEdits: {}
   });
   let S;
   try { S = JSON.parse(localStorage.getItem(LS)) || DEF(); } catch (e) { S = DEF(); }
@@ -193,6 +194,44 @@
     });
     return plan;
   }
+  /* 自动执行：过了的日子按计划算已经吃过/已经买过，库存自己滚起来，不用每天点 */
+  function syncAuto() {
+    if ((S.settings.autoExec || 'auto') !== 'auto') return false;
+    const t = today();
+    let changed = false;
+    const buys = {};
+    const sh = C.shopping(S.weekStart, S);
+    const hour = new Date().getHours();
+    const shopHour = S.settings.shopHour == null ? 18 : +S.settings.shopHour;
+    (sh.batches || []).forEach(b => {
+      /* 今天的单要等到傍晚（默认 18 点后）才算买过，白天还留给你自己下单/改 */
+      const due = b.deliver < t || (b.deliver === t && hour >= shopHour);
+      if (b.items.length && due && !(S.ordered || {})[b.deliver]) buys[b.deliver] = b;
+    });
+    const dates = {};
+    Object.keys(buys).forEach(d => { dates[d] = 1; });
+    Object.keys(S.plans || {}).forEach(ws => (S.plans[ws].days || []).forEach(m => {
+      if (m.date < t && m.status === 'cook' && (m.dishes || []).length && !m.done) dates[m.date] = 1;
+    }));
+    Object.keys(dates).sort().forEach(d => {
+      const b = buys[d];
+      if (b) {
+        const added = [];
+        b.items.forEach(x => { const g = x.packs * x.specG; C.addInv(S, x.key, g); added.push({ key: x.key, g }); });
+        S.ordered = S.ordered || {};
+        S.ordered[d] = { at: d, total: b.pay, added, auto: true };
+        changed = true;
+      }
+      const m = mealForDate(d);
+      if (m && m.date < t && m.status === 'cook' && (m.dishes || []).length && !m.done) {
+        const r = C.consumeInv(S, C.mealNeeds(S, m));
+        m.done = true; m.deducted = r.used;
+        changed = true;
+      }
+    });
+    return changed;
+  }
+
   /* 历史快照：过一天就拍一张，之后重排菜单不会改动它 */
   function syncHistory() {
     const t = today();
@@ -343,17 +382,23 @@
       const ukey = bi + ':' + x.key;
       const uOpen = !!usesOpen[ukey];
       const uSum = us.map(u => u.name).join('、');
-      return `<div class="item ${on ? 'done' : ''}">
-        <div class="cb ${on ? 'on' : ''}" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>✓</div>
-        <div style="flex:1;min-width:0" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>
+      return `<div class="item">
+        <div style="flex:1;min-width:0">
           <div class="nm">${esc(x.name)} ×${x.packs} ${pack}${early}</div>
           <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}${x.early ? ` · 本来在「${esc(x.early)}」` : ''}${b.swaps && b.swaps[x.key] ? ` · 顶替${esc((C.ING[b.swaps[x.key]] || {}).name || '')}` : ''}</div>
           ${us.length ? `<div class="uses"><span class="link" data-act="uses" data-arg="${ukey}">${uOpen ? '收起' : '用在 ' + us.length + ' 道菜'}</span>
             ${uOpen ? `<div class="use-list">${us.map(u => `<div class="row" style="padding:2px 0"><span>${esc(u.name)}</span><span class="sp"></span><span class="muted">${u.g}g</span></div>`).join('')}</div>`
                     : `<span class="muted" style="margin-left:8px">${esc(uSum.length > 24 ? uSum.slice(0, 24) + '…' : uSum)}</span>`}</div>` : ''}
         </div>
-        <div class="pr">${C.yuan(x.unit * x.packs)}</div></div>`;
+        <div style="text-align:right;flex:0 0 auto">
+          <div class="pr">${C.yuan(x.unit * x.packs)}</div>
+          ${past ? '' : `<button class="link" data-act="drop" data-arg="${bi}:${x.key}" style="margin-top:6px">不买了</button>`}
+        </div></div>`;
     }).join('');
+    /* 被"不买了"划掉的行，留着让人能恢复 */
+    const dropList = (b.dropped || []).map(x =>
+      `<div class="row" style="padding:6px 0"><span class="muted" style="text-decoration:line-through">${esc(x.sku)} ×${x.packs}</span>
+        <span class="sp"></span><button class="link" data-act="undrop" data-arg="${bi}:${x.key}">恢复</button></div>`).join('');
     const f = !past && b.gap > 0 && b.items.length ? C.fillers(b).slice(0, 4) : [];
     const fSum = f.reduce((a, x) => a + x.price, 0);
     const fAll = b.total + fSum;
@@ -407,8 +452,10 @@
         <div class="muted" style="margin-top:6px;border-top:1px dashed var(--line);padding-top:6px">
           全加 ¥${fSum.toFixed(2)} → 合计 ${C.yuan(fAll)}${fAll >= 39 ? '，免运费' : `，仍差 ${C.yuan(39 - fAll)}`}</div></div>` : ''}
       <div class="sec-title">要买 ${b.items.length} 样${past ? '（当时）' : ''}</div>
-      ${past ? '' : `<div class="muted" style="margin:-4px 2px 8px">前面的方框是你在七鲜逛的时候自己勾的记号，勾上只是把这一行划掉，不改金额、也不代表已经入库——入库要点下面的「这单买了」。</div>`}
+      ${past ? '' : `<div class="muted" style="margin:-4px 2px 8px">不想买的点这一行右边的「不买了」，它就从这单里划掉，金额和库存都跟着变（随时能恢复）。</div>`}
       <div class="card">${items || '<div class="muted">这一单不用买生鲜</div>'}</div>
+      ${dropList ? `<div class="card" style="padding:8px 14px;margin-top:8px">
+        <div class="muted" style="margin-bottom:2px">你划掉的（不影响金额）</div>${dropList}</div>` : ''}
       ${(b.flex && b.flex.length) ? `<div class="sec-title">打扫冰箱的菜（蔬菜不另买）</div><div class="card" style="padding:8px 14px">
         <div class="muted">这${b.flex.length} 样是给「${[...new Set(b.flex.map(f => f.dish))].map(esc).join('、')}」留的，做的时候冰箱里有什么放什么，所以没算进这单：</div>
         ${b.flex.map(f => `<div class="row" style="padding:3px 0;font-size:13px"><span>${esc(f.name)}</span><span class="sp"></span>
@@ -426,12 +473,12 @@
         <div class="row"><span>${b.restock.map(r => esc(r.name)).join('、')}</span></div>
         <div class="muted" style="margin-top:6px">你在「库存」里标了待补。七鲜没有固定规格价，没算进金额；买完点回「充足」就行。</div>
       </div>` : ''}
-      ${past ? `<div class="hint" style="margin:14px 0">这一单已经过去了。要看接下来买什么，点上面「周三单 / 周日单(下周)」，或者翻到下一周。</div>` : `
-      <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="buy" data-arg="${bi}">${b.ordered ? '这单已记进库存（点一下撤销）' : '这单买了 → 记进库存'}</button></div>
+      ${past ? `<div class="hint" style="margin:14px 0">这一单已经过去了。要看接下来买什么，点上面那一排日期，或者翻到下一周。</div>` : `
+      <div class="row" style="margin:14px 0"><button class="btn primary block" data-act="openbuy" data-arg="${bi}">${b.ordered ? '这单已记进库存（点一下撤销）' : '按实际买到的填价格 → 记进库存'}</button></div>
       <div class="row" style="margin-top:-6px;margin-bottom:14px"><button class="btn block" data-act="copy" data-arg="${bi}">复制清单</button></div>
-      <div class="hint">点「这单买了」以后，整包的量会进库存，后面的排期和采购会自动扣掉，不用再买第二遍。
-        买完回来点「回填实付」，填一次真实扣款，之后所有估价都按你的券后价来（现在是 ${
-        b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。</div>`}`;
+      <div class="hint">点上面那个按钮会先让你按实际买到的数量和价格逐样填一遍，填完才入库——这样库存里是真实克数、以后估价也按你真实的券后价算（现在是 ${
+        b.factor === 1 ? '标价' : '标价的 ' + Math.round(b.factor * 100) + '%'}）。
+        ${S.settings.autoExec === 'auto' ? '现在是「自动执行」：过了下单日会自动按标价入库，想自己填就在设置里关掉自动。' : ''}</div>`}`;
   }
 
   /* ---------------- 菜库 ---------------- */
@@ -566,6 +613,12 @@
           <button class="chip ${s.shopMode === 'week' ? 'on' : ''}" data-act="shopmode" data-arg="week">一周只买一次</button>
         </div>
         <div class="muted" style="margin-bottom:10px">「按保质期分单」会算好哪天该补一次菜，叶菜不会放到第 5 天；「一周只买一次」就是一车买齐一周。</div>
+        <label class="fld">库存怎么记</label>
+        <div class="chips" style="margin:0 0 2px">
+          <button class="chip ${(s.autoExec || 'auto') === 'auto' ? 'on' : ''}" data-act="autoexec" data-arg="auto">自动执行（推荐）</button>
+          <button class="chip ${s.autoExec === 'manual' ? 'on' : ''}" data-act="autoexec" data-arg="manual">每步手动确认</button>
+        </div>
+        <div class="muted" style="margin-bottom:10px">「自动执行」：排好的日子过了就按计划算吃过、下单日到了就按标价自动入库，你不用每天点按钮；想手动核对就切到「每步手动确认」。</div>
         <label class="fld">工作日最多做多久（分钟）</label>
         <input type="number" value="${s.weekdayMax}" data-act="setnum" data-arg="weekdayMax">
         <label class="fld">周末最多做多久（分钟）</label>
@@ -630,6 +683,7 @@
     const t = today();
     if (S.day0 !== t) { S.day0 = t; S.weekStart = C.mondayOf(t); }
     if (S.tab === 'week' || S.tab === 'shop') ensureAhead();
+    if (syncAuto()) save();
     if (syncHistory()) save();
     renderTop();
     ({ week: viewWeek, shop: viewShop, lib: viewLib, inv: viewInv, set: viewSet }[S.tab] || viewWeek)();
@@ -916,8 +970,38 @@
       <div class="row" style="margin-top:8px"><button class="btn danger block" data-act="delinv" data-arg="${id}">删除这条</button></div>`);
   }
 
+  /* 逐样回填：实际买了几包、实际花了多少钱（这一步在入库之前） */
+  function sheetBuy(bi) {
+    const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+    if (!b) return;
+    S.buyEdits = S.buyEdits || {};
+    const ed = S.buyEdits[b.deliver] = S.buyEdits[b.deliver] || {};
+    const rows = b.items.map((x, i) => {
+      const e = ed[x.key] || {};
+      const packs = e.packs != null ? e.packs : x.packs;
+      const price = e.price != null ? e.price : Math.round(x.unit * packs * 100) / 100;
+      return `<div style="padding:10px 0;border-bottom:1px dashed var(--line)">
+        <div class="nm" style="font-size:15px">${esc(x.sku)}</div>
+        <div class="muted" style="margin:2px 0 6px">预估 ×${x.packs} = ${C.yuan(x.unit * x.packs)}${ed[x.key] ? ' · 已改' : ''}</div>
+        <div class="row" style="gap:8px">
+          <label class="muted" style="flex:0 0 34px">数量</label>
+          <input type="number" class="bq" data-key="${x.key}" value="${packs}" min="0" step="1" style="flex:0 0 62px">
+          <label class="muted" style="flex:0 0 34px;text-align:right">实付</label>
+          <input type="number" class="bp" data-key="${x.key}" value="${price}" min="0" step="0.01" style="flex:1">
+        </div>
+      </div>`;
+    }).join('');
+    showSheet(`
+      <h2>按实际买到的填一遍</h2>
+      <div class="sheet-sub">${b.name} · ${b.note} · 预估 ${C.yuan(b.pay)}</div>
+      <div class="hint" style="margin-bottom:6px">数量填 0 表示这条没买（会从这单划掉）。填完才记进库存，库存里就是真实克数，以后估价也按你填的真实价格折算。</div>
+      <div class="card" style="margin:10px 0;padding:0 14px">${rows || '<div class="muted">这单没有要买的</div>'}</div>
+      <div class="row" style="margin-top:10px"><button class="btn primary block" data-act="dobuy" data-arg="${bi}">确认入库</button></div>`);
+  }
+
   /* ---------------- 动作 ---------------- */
   const riceFor = kind => (kind === 'onepot' ? 0 : C.constraints(S).riceDefault);
+
   function sheetPaid() {
     const sh = C.shopping(S.weekStart, S), b = sh.batches[shopBatch];
     const est = b.total, raw = b.rawTotal || est;
@@ -1147,6 +1231,75 @@
       viewLib();
       toast(`${d.name} 已加进菜谱`);
     },
+    openbuy: bi => {
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+      if (!b) return;
+      if (b.ordered) return ACT.buy(+bi);          // 已经入过库，点一下是撤销
+      if (!b.items.length) return toast('这单没有要买的东西');
+      sheetBuy(+bi);
+    },
+    /* 逐样回填后入库：数量 0 视为没买 */
+    dobuy: bi => {
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+      if (!b) return;
+      const read = cls => {
+        const out = {};
+        try {
+          const list = document.querySelectorAll('.' + cls) || [];
+          for (let i = 0; i < list.length; i++) {
+            const el = list[i];
+            const k = el.dataset && el.dataset.key;
+            if (k && el.value !== '' && el.value != null) out[k] = +el.value;
+          }
+        } catch (e) {}
+        return out;
+      };
+      const qty = read('bq'), pri = read('bp');
+      const ed = ((S.buyEdits || {})[b.deliver]) || {};
+      const added = [], rows = [];
+      let actual = 0, est = 0;
+      b.items.forEach(x => {
+        const packs = qty[x.key] != null ? qty[x.key] : (ed[x.key] && ed[x.key].packs != null ? ed[x.key].packs : x.packs);
+        const price = pri[x.key] != null ? pri[x.key] : (ed[x.key] && ed[x.key].price != null ? ed[x.key].price : x.unit * packs);
+        est += x.unit * x.packs;
+        if (!(packs > 0)) {                            // 没买：从这单划掉
+          S.dropped = S.dropped || {};
+          (S.dropped[b.deliver] = S.dropped[b.deliver] || {})[x.key] = true;
+          return;
+        }
+        const g = Math.round(packs * x.specG);
+        C.addInv(S, x.key, g);
+        added.push({ key: x.key, g });
+        rows.push({ key: x.key, packs, price: Math.round(price * 100) / 100 });
+        actual += price;
+      });
+      S.ordered = S.ordered || {};
+      S.ordered[b.deliver] = { at: today(), total: Math.round(actual * 100) / 100, added, rows };
+      /* 用真实总价校准以后的估价 */
+      if (actual > 0 && est > 0) {
+        const f = Math.max(0.5, Math.min(1.3, actual / est));
+        S.priceFactor = Math.round(f * 1000) / 1000;
+      }
+      delete (S.buyEdits || {})[b.deliver];
+      save(); hideSheet(); viewShop();
+      toast(added.length ? `已入库 ${added.length} 样，实付 ${C.yuan(actual)}` : '这单什么都没买');
+    },
+    drop: a => {
+      const [bi, key] = a.split(':');
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+      if (!b) return;
+      S.dropped = S.dropped || {};
+      (S.dropped[b.deliver] = S.dropped[b.deliver] || {})[key] = true;
+      save(); viewShop(); toast('这一行不买了，金额已扣掉');
+    },
+    undrop: a => {
+      const [bi, key] = a.split(':');
+      const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
+      if (!b) return;
+      const d = (S.dropped || {})[b.deliver];
+      if (d) { delete d[key]; if (!Object.keys(d).length) delete S.dropped[b.deliver]; }
+      save(); viewShop(); toast('已放回清单');
+    },
     buy: bi => {
       const sh = C.shopping(S.weekStart, S), b = sh.batches[+bi];
       if (!b) return;
@@ -1220,6 +1373,11 @@
     },
     setmeat: n => { S.settings.meatPerWeek = +n; save(); viewSet(); },
     shopmode: m => { S.settings.shopMode = m === 'week' ? 'week' : 'auto'; shopBatch = 0; save(); viewSet(); },
+    autoexec: m => {
+      S.settings.autoExec = m === 'manual' ? 'manual' : 'auto';
+      save(); render(); viewSet();
+      toast(S.settings.autoExec === 'auto' ? '以后自动按计划扣库存' : '改回每步手动确认');
+    },
     setstaple: k => { S.settings.staple = k; save(); viewSet(); },
     seteaters: n => { S.settings.eatersDefault = +n; save(); viewSet(); },
     goto: t => { S.tab = t; if (t === 'shop') shopBatch = -1; save(); render(); },
@@ -1368,6 +1526,10 @@
         S.eatersByDate[d1] = ids; S.eatersByDate[d2] = ids;
         [d1, d2].forEach(d => { const m = mealForDate(d); if (m) setEaters(d, ids); });
         S.tab = 'week'; save(); render();
+      }
+      else if (ui.startsWith('buy')) {
+        const i = (C.shopping(S.weekStart, S).batches || []).findIndex(x => x.items.length);
+        if (i >= 0) { shopBatch = i; sheetBuy(i); }
       }
       else if (ui.startsWith('eaters:')) sheetEaters(ui.slice(7));
       else if (ui === 'twosheet') {
