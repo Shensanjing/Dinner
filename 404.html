@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="app.css?v=202611080703">
+<link rel="stylesheet" href="app.css?v=202611111224">
 </head>
 <body>
 <div id="app">
@@ -35,13 +35,13 @@
 <div id="backdrop"></div>
 <div id="sheet"></div>
 <div class="toast" id="toast"></div>
-<script src="data/bundle.js?v=202611080703"></script>
-<script src="core.js?v=202611080703"></script>
-<script src="app.js?v=202611080703"></script>
+<script src="data/bundle.js?v=202611111224"></script>
+<script src="core.js?v=202611111224"></script>
+<script src="app.js?v=202611111224"></script>
 <script>
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js?v=202611080703').catch(e => console.warn('SW 注册失败（可能不是 https）', e));
+    navigator.serviceWorker.register('./sw.js?v=202611111224').catch(e => console.warn('SW 注册失败（可能不是 https）', e));
   });
 }
 </script>

@@ -347,7 +347,7 @@
         <div class="cb ${on ? 'on' : ''}" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>✓</div>
         <div style="flex:1;min-width:0" ${past ? '' : `data-act="chk" data-arg="${bi}:${x.key}"`}>
           <div class="nm">${esc(x.name)} ×${x.packs} ${pack}${early}</div>
-          <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}${x.early ? ` · 本来在「${esc(x.early)}」` : ''}</div>
+          <div class="sk">${esc(x.sku)}${x.real ? '' : ' · 估价'} · 这单用 ${x.gross}g${x.carry ? `（上单剩 ${x.carry}g 已抵扣）` : ''}${x.early ? ` · 本来在「${esc(x.early)}」` : ''}${b.swaps && b.swaps[x.key] ? ` · 顶替${esc((C.ING[b.swaps[x.key]] || {}).name || '')}` : ''}</div>
           ${us.length ? `<div class="uses"><span class="link" data-act="uses" data-arg="${ukey}">${uOpen ? '收起' : '用在 ' + us.length + ' 道菜'}</span>
             ${uOpen ? `<div class="use-list">${us.map(u => `<div class="row" style="padding:2px 0"><span>${esc(u.name)}</span><span class="sp"></span><span class="muted">${u.g}g</span></div>`).join('')}</div>`
                     : `<span class="muted" style="margin-left:8px">${esc(uSum.length > 24 ? uSum.slice(0, 24) + '…' : uSum)}</span>`}</div>` : ''}
@@ -409,6 +409,11 @@
       <div class="sec-title">要买 ${b.items.length} 样${past ? '（当时）' : ''}</div>
       ${past ? '' : `<div class="muted" style="margin:-4px 2px 8px">前面的方框是你在七鲜逛的时候自己勾的记号，勾上只是把这一行划掉，不改金额、也不代表已经入库——入库要点下面的「这单买了」。</div>`}
       <div class="card">${items || '<div class="muted">这一单不用买生鲜</div>'}</div>
+      ${(b.flex && b.flex.length) ? `<div class="sec-title">打扫冰箱的菜（蔬菜不另买）</div><div class="card" style="padding:8px 14px">
+        <div class="muted">这${b.flex.length} 样是给「${[...new Set(b.flex.map(f => f.dish))].map(esc).join('、')}」留的，做的时候冰箱里有什么放什么，所以没算进这单：</div>
+        ${b.flex.map(f => `<div class="row" style="padding:3px 0;font-size:13px"><span>${esc(f.name)}</span><span class="sp"></span>
+          <span class="muted">${f.dish} · ${f.g}g</span></div>`).join('')}
+      </div>` : ''}
       ${b.opt.length ? `<div class="sec-title">可选加的</div><div class="card" style="padding:8px 14px">
         ${b.opt.map(x => `<div class="row" style="padding:4px 0"><span class="muted">${esc(x.name)}</span><span class="sp"></span><span class="muted">${x.g}g</span></div>`).join('')}</div>` : ''}
       <div class="sec-title">家里还有 / 常备（不用买）</div>
@@ -727,7 +732,14 @@
       const u = x.unit || '';
       const gramLike = u === 'g' || u === 'ml' || u === '';
       const raw = x.qty && !gramLike ? `${unitTxt(x.qty * k)}${u}` : '';
-      return `<tr><td>${esc(x.name)}${x.opt ? ' <span class="muted">(可选)</span>' : ''}</td>
+      const have = C.invQty(S, x.key, today());
+      const alt = (C.altsOf(d, x.key) || []).map(kk => (C.ING[kk] || {}).name).filter(Boolean);
+      const tips = [];
+      if (x.opt) tips.push(have > 0 ? `家里有 ${Math.round(have)}g，想加就放` : '家里没有，不加也行');
+      if (alt.length) tips.push('也可以换成 ' + alt.join(' / '));
+      if (!x.opt && have > 0) tips.push(`家里有 ${Math.round(have)}g`);
+      const note = tips.length ? ` <span class="muted">· ${tips.join(' · ')}</span>` : '';
+      return `<tr><td>${esc(x.name)}${x.opt ? ' <span class="muted">(可选)</span>' : ''}${note}</td>
         <td>${raw ? raw + ' · ' : ''}${num(x.g * k)}g</td></tr>`;
     }).join('');
     const sea = d.season.map(x => `<tr><td>${esc(x.name)}</td><td>${x.qty ? unitTxt(x.qty * k) + (x.unit || '') + ' · ' : ''}${num(x.g * k)}g</td></tr>`).join('');
@@ -1170,6 +1182,16 @@
         save(); sheetMeal(d); toast('已撤销，库存加回去了'); return;
       }
       const needs = C.mealNeeds(S, m);
+      /* 可选加的食材：家里有就顺手用掉（不确定你加没加，按"有就用"）。不报缺货。 */
+      (m.dishes || []).forEach(id => {
+        const d = DISH[id]; if (!d) return;
+        const sc = C.dishScale(S, m);
+        (d.ing || []).forEach(x => {
+          if (!x.opt) return;
+          const have = C.invQty(S, x.key, m.date || today());
+          if (have > 0) needs[x.key] = Math.min(have, x.g * sc);
+        });
+      });
       const r = C.consumeInv(S, needs);
       setMeal(d, { done: true, deducted: r.used });
       save(); sheetMeal(d);
@@ -1354,6 +1376,13 @@
         const ids = S.profiles.slice(0, 2).map(p => p.id);
         S.eatersByDate[d1] = ids; setEaters(d1, ids);
         S.tab = 'week'; save(); render(); sheetEaters(d1);
+      }
+      else if (ui === 'flex') {
+        const d1 = C.addD(today(), 1), pw = C.mondayOf(d1);
+        if (!S.plans[pw]) S.plans[pw] = C.generate(pw, S);
+        const mm = S.plans[pw].days.find(x => x.date === d1);
+        if (mm) { mm.status = 'cook'; mm.dishes = ['d49']; mm.rice = 0; }
+        S.tab = 'shop'; save(); render();
       }
       else if (ui === 'twomeal') {
         if (S.profiles.length < 2) S.profiles.push({ id: 'p2x', name: '家人', portion: 1 });

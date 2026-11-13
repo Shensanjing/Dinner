@@ -6,6 +6,40 @@
   const ING = {};
   DATA.ingredients.forEach(i => { ING[i.key] = i; });
 
+  /* ---------- 菜谱里"可变"的三种情况 ----------
+     1) 可选加（x.opt）：加了更像饭馆版，不加也行 → 不进采购，库里有就顺手用掉
+     2) 二选一（d.alts）：菜谱里写"（或…）"的地方，白菜 or 包菜 → 只买一个，优先家里有的
+     3) 随便放（FLEX）：什锦炒饭/炒面这类打扫冰箱的 → 蔬菜不硬买，排期优先清冰箱
+     二选一是按菜登记的：牛肉和猪肉只在麻婆豆腐里能互换，不能全局通用。 */
+  const DISH_ALTS = {
+    '蒜薹炒肉': { pork_belly: ['pork_shoulder'], pork_shoulder: ['pork_belly'] },
+    '麻婆豆腐': { beef: ['pork_belly'], pork_belly: ['beef'] },
+    '咖喱鸡': { chicken_breast: ['chicken_leg'], chicken_leg: ['chicken_breast'] },
+    '鸡丝凉面': { chicken_breast: ['chicken_leg'], chicken_leg: ['chicken_breast'] },
+    '干蒸排骨': { scallion: ['spring_onion'], spring_onion: ['scallion'] },
+    '菜丝炒面': { garden_cabbage: ['cabbage'], cabbage: ['garden_cabbage'] }
+  };
+  const FLEX_NAMES = ['什锦炒饭', '什锦炒面'];
+  DATA.dishes.forEach(d => {
+    if (DISH_ALTS[d.name]) d.alts = DISH_ALTS[d.name];
+    if (FLEX_NAMES.indexOf(d.name) >= 0) d.flex = true;
+  });
+  (DATA.suggest || []).forEach(d => {
+    if (DISH_ALTS[d.name]) d.alts = DISH_ALTS[d.name];
+    if (FLEX_NAMES.indexOf(d.name) >= 0) d.flex = true;
+  });
+  const isFlex = d => !!(d && d.flex);
+  const altsOf = (d, key) => (d && d.alts && d.alts[key]) || null;
+  /* 二选一：优先拿家里有的 / 这天别的菜也要用的，都没有就用原配 */
+  function pickKey(state, d, key, date, also) {
+    const alts = altsOf(d, key);
+    if (!alts) return key;
+    const cands = [key].concat(alts);
+    for (const k of cands) if (invQty(state, k, date) > 0) return k;
+    if (also) for (const k of cands) if (also[k]) return k;
+    return key;
+  }
+
   const DAY = 864e5;
   const WEEK_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
@@ -263,14 +297,26 @@
     if (!state || !state.inventory || !state.inventory.length) return 0;
     let v = 0;
     (d.ing || []).forEach(x => {
-      if (x.opt) return;
-      const have = invQty(state, x.key, onDate);
+      const k = pickKey(state, d, x.key, onDate, null);
+      const have = invQty(state, k, onDate);
       if (have <= 0) return;
+      /* 可选加的食材：家里有就顺手用了，加一点点分 */
+      if (x.opt) { v += Math.min(1, have / Math.max(1, x.g)); return; }
       v += Math.min(2, have / Math.max(1, x.g));      // 够用越多越该做
-      const days = invDays(state, x.key, onDate);
+      const days = invDays(state, k, onDate);
       if (days !== null && days <= 3) v += 2.5;       // 三天内要坏的，优先
       else if (days !== null && days <= 6) v += 1;
     });
+    /* 打扫冰箱的菜：冰箱里临期的蔬菜越多，越该排它 */
+    if (isFlex(d)) {
+      const near = (state.inventory || []).filter(it => {
+        const meta = ING[it.key];
+        return meta && meta.cat === '蔬菜' && it.g > 20;
+      }).map(it => invDays(state, it.key, onDate)).filter(n => n !== null);
+      const urgent = near.filter(n => n <= 4).length;
+      const soon = near.filter(n => n > 4 && n <= 8).length;
+      v += Math.min(6, urgent * 3 + soon * 1.2);
+    }
     return v;
   }
 
@@ -449,8 +495,10 @@
         if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) continue;
         const it = ING[x.key];
         if (!it || it.pantry) continue;
+        if (isFlex(d) && it.cat === '蔬菜') continue;   // 这种菜的蔬菜家里有什么放什么，不算缺
         any = true;
-        if (invQty(state, x.key, onDate) < x.g * scale) return false;
+        const k2 = pickKey(state, d, x.key, onDate, null);
+        if (invQty(state, k2, onDate) < x.g * scale) return false;
       }
     }
     if (m.rice) {
@@ -513,7 +561,10 @@
       const d = DISH[id]; if (!d) return;
       (d.ing || []).forEach(x => {
         if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) return;
-        out[x.key] = (out[x.key] || 0) + x.g * scale;
+        const it0 = ING[x.key] || {};
+        if (isFlex(d) && it0.cat === '蔬菜') return;    // 打扫冰箱的菜，蔬菜用了什么说不准
+        const k2 = pickKey(state, d, x.key, meal.date || todayStr(), out);
+        out[k2] = (out[k2] || 0) + x.g * scale;
       });
     });
     if (meal.rice) {
@@ -551,13 +602,18 @@
     const m = pl && (pl.days || []).find(x => x.date === date);
     if (!m || m.status !== 'cook' || !m.dishes || !m.dishes.length) return [];
     const set = new Set();
+    const also = {};
     m.dishes.forEach(id => {
       const d = DISH[id]; if (!d) return;
       d.ing.forEach(x => {
         if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water' || x.opt) return;
         const it = ING[x.key];
         if (!it || it.pantry) return;
-        set.add(x.key);
+        /* 打扫冰箱的菜，蔬菜部分不硬买 */
+        if (isFlex(d) && it.cat === '蔬菜') return;
+        const k = pickKey(state, d, x.key, date, also);
+        set.add(k);
+        also[k] = 1;
       });
     });
     return [...set];
@@ -591,7 +647,7 @@
       const keys = new Set();
       w.days.forEach(d => dayKeys(state, d).forEach(x => keys.add(x)));
       const last = w.days[w.days.length - 1];
-      const ok = keys.size > 0 && keys.size <= 2 &&
+      const ok = keys.size > 0 && keys.size <= 2 && dspan(prev.deliver, last) <= 6 &&
         [...keys].every(x => keepDays(x) >= 5 && dspan(prev.deliver, last) <= keepDays(x) - 1);
       if (ok) { prev.days = prev.days.concat(w.days); waves.splice(k, 1); }
     }
@@ -647,10 +703,24 @@
             if (x.key === 'rice_cooked' || x.key === 'brown_rice_cooked' || x.key === 'water') return;
             const grams = x.g * scale;
             if (x.opt) { b.optSet = b.optSet || {}; b.optSet[x.key] = (b.optSet[x.key] || 0) + grams; return; }
-            b.needs[x.key] = (b.needs[x.key] || 0) + grams;
-            nb[x.key] = (nb[x.key] || 0) + grams;
+            const it0 = ING[x.key] || {};
+            /* 打扫冰箱的菜：蔬菜部分用家里现成的，不硬买（葱姜蒜一起跳过，本来也是常备） */
+            if (isFlex(d) && it0.cat === '蔬菜') {
+              if (['scallion', 'ginger', 'garlic', 'spring_onion'].indexOf(x.key) < 0) {
+                const fl = (b.flex = b.flex || []);
+                const hitF = fl.find(f => f.dish === d.name && f.name === it0.name);
+                if (hitF) hitF.g = Math.max(hitF.g, Math.round(grams));
+                else fl.push({ dish: d.name, name: it0.name, g: Math.round(grams) });
+              }
+              return;
+            }
+            const k2 = pickKey(state, d, x.key, dt0, b.needs);
+            b.needs[k2] = (b.needs[k2] || 0) + grams;
+            nb[k2] = (nb[k2] || 0) + grams;
+            b.swaps = b.swaps || {};
+            if (k2 !== x.key) b.swaps[k2] = x.key;
             /* 记下"这 50g 是哪道菜要的"，采购行展开就能看到 */
-            const use = (b.uses[x.key] = b.uses[x.key] || []);
+            const use = (b.uses[k2] = b.uses[k2] || []);
             const hit = use.find(u => u.name === d.name);
             if (hit) hit.g += grams; else use.push({ name: d.name, g: grams });
           });
@@ -880,6 +950,8 @@
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
     invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal, stapleKind, stapleWeek,
     priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore, mealInStock,
-    wavesOf, waveFor, dayKeys, eaterIdsFor, portionOf, mealScale, dishScale, mealEaters
+    wavesOf, waveFor, dayKeys, eaterIdsFor, portionOf, mealScale, dishScale, mealEaters,
+    altKeys: (id, k) => altsOf(DISH[id] || (DATA.suggest || []).find(d => d.id === id), k),
+    altsOf, isFlex
   };
 })(typeof window !== 'undefined' ? window : globalThis);
