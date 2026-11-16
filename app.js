@@ -700,6 +700,34 @@
   }
   $('#backdrop').onclick = hideSheet;
 
+  /* 开工：把两三道菜的工序排成一条时间轴，边做边看 */
+  function sheetFlow(date) {
+    const m = mealForDate(date) || { date, dishes: [] };
+    const p = C.wfPlan(S, m);
+    if (!p.steps.length) { sheetMeal(date); toast('这天还没排菜'); return; }
+    const [y, mo, da] = date.split('-');
+    const start = new Date();
+    const clock = min => {
+      const d2 = new Date(start.getTime() + min * 60000);
+      return ('0' + d2.getHours()).slice(-2) + ':' + ('0' + d2.getMinutes()).slice(-2);
+    };
+    const rows = p.steps.map((s, i) => {
+      const st = `<span class="wf-t">${clock(s.start)}</span>`;
+      const dur = `<span class="wf-d">${s.dur} 分</span>`;
+     	return `<div class="wf-row ${s.hands ? '' : 'passive'}">
+        <div class="wf-head">${st}<b>${esc(s.label)}</b>${s.hands ? '' : '<span class="wf-badge">后台</span>'}${dur}</div>
+        <div class="wf-sub">${esc(s.dish)}${s.hands ? '' : ' · 不用管，到点再回来'}</div>
+      </div>`;
+    }).join('');
+    showSheet(`
+      <h2>开工 · ${C.WEEK_CN[C.dow(date)]} ${+mo}月${+da}日</h2>
+      <div class="sheet-sub">总共 ${p.total} 分钟 · ${p.total < 45 ? clock(p.total) + ' 前后能吃上' : clock(p.total) + ' 左右能吃上'}</div>
+      ${p.prep.length ? `<div class="hint" style="margin:0 0 10px">${p.prep.map(x => `「${esc(x.dish)}」${esc(x.what)}，得提前 ${x.lead} 分钟开始。`).join('')}</div>` : ''}
+      <div class="wf-list">${rows}</div>
+      <div class="hint" style="padding:8px 4px 4px">灰底是"不用管"的步骤（蒸、焖）：这段时间正好去切配。菜出锅时间已经尽量贴着上桌，米饭会先好，多焖几分钟没关系。</div>
+      <button class="btn" data-act="meal" data-arg="${date}">回到这顿</button>`);
+  }
+
   function sheetMeal(date) {
     const m = mealForDate(date) || { date, status: 'empty', dishes: [], rice: 0 };
     const ds = (m.dishes || []).map(id => dishById(id)).filter(Boolean);
@@ -721,6 +749,7 @@
       </div>`).join('')}
       <div class="act-list">
         ${ds.length === 1 ? `<button class="act" data-act="addside" data-arg="${date}"><span class="em">➕</span>再加一道配菜</button>` : ''}
+        ${ds.length && m.status !== 'out' ? `<button class="act" data-act="flow" data-arg="${date}"><span class="em">🍳</span>开始做饭（看流程 · ${C.wfPlan(S, m).total} 分钟）</button>` : ''}
         <button class="act" data-act="picker" data-arg="${date}"><span class="em">🔄</span>${ds.length > 1 ? '两道一起换' : (d ? '换掉这道菜（重新挑一道）' : '选一道菜')}</button>
         ${m.status === 'out' ? '' : `<button class="act" data-act="done" data-arg="${date}"><span class="em">✅</span>${m.done ? '已经做了（点一下撤销）' : '这顿做了 → 从库存扣掉'}</button>`}
         <button class="act" data-act="out" data-arg="${date}"><span class="em">🍽</span>${m.status === 'out' ? '改成在家吃' : (date === today() ? '今天出去吃' : '这天出去吃')}</button>
@@ -1096,6 +1125,7 @@
 
   const ACT = {
     meal: d => sheetMeal(d),
+    flow: d => sheetFlow(d),
     dish: a => { const [id, date] = String(a).split('|'); const m = date ? mealForDate(date) : null; sheetDish(id, m ? C.dishScale(S, m) : 1); },
     close: () => hideSheet(),
     picker: d => { pickSlot = null; sheetPicker(d); },
@@ -1562,13 +1592,15 @@
         viewShop();
       }
       else if (ui.startsWith('meal:')) sheetMeal(ui.slice(5));
+      else if (ui.startsWith('flow:')) sheetFlow(ui.slice(5));
       else if (ui.startsWith('pick:')) sheetPicker(ui.slice(5));
     }
   } catch (e) {}
 
   // 测试钩子（浏览器里无副作用，node 里用来驱动渲染做断言）
   window.__app = {
-    ACT, render, sheetDish, sheetMeal, sheetPicker, showSheet, hideSheet,
+    ACT, render, sheetDish, sheetMeal, sheetPicker, sheetFlow, sheetBuy, sheetEaters,
+    showSheet, hideSheet,
     get state() { return S; }, set state(v) { S = v; }, save
   };
 })();
