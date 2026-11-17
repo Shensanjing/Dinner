@@ -676,7 +676,10 @@
     const today = todayStr();
     if (!Object.keys(plans).length) return { ws, batches: [] };
     const from = ws > today ? ws : today;
-    const waves = wavesOf(state, from, 21);
+    /* 只看"往前 14 天"：看得见的日子和算进去的日子保持一致，免得清单里冒出没排的菜 */
+    const waves = wavesOf(state, from, 14).map(w => ({
+      deliver: w.deliver, days: w.days.filter(d => dspan(from, d) <= 13)
+    })).filter(w => w.days.length);
     if (!waves.length) return { ws, batches: [] };
     const out = waves.map((w, i) => ({
       b: i, order: w.deliver, deliver: w.deliver, days: w.days,
@@ -973,42 +976,122 @@
   const wfLabel = t => {
     const s = String(t || '');
     if (/烧水|水开/.test(s) && !/炒|煎|煸/.test(s)) return '烧水：' + (wfShort(s) || '');
+    if (/烧热|烧开|热锅|热油/.test(s) && !/下锅|倒入|放入/.test(s)) return '烧锅：' + (wfShort(s) || '');
     const v = /焯/.test(s) ? '焯水' : /煎/.test(s) ? '煎' : /煸/.test(s) ? '煸炒'
       : /炖|焖/.test(s) ? '炖煮' : /煮/.test(s) ? '煮' : /蒸/.test(s) ? '蒸'
       : /炸/.test(s) ? '炸' : /炒|翻炒|下锅/.test(s) ? '炒' : '下锅';
     return v + '：' + (wfShort(s) || '');
   };
 
-  /* 一道菜的工序卡：按每段做法的性质拆成 洗切 / 焯水 / 调汁 / 下锅，最后收汁装盘 */
+  /* 小句切分：按逗号/分号/句号拆开，去掉"将/把/取/用"这种口头前缀 */
+  const wfClauses = s => String(s || '').split(/[，,；;。]/).map(x => x.trim()).filter(Boolean);
+
+  /* 这句话是不是"只加调料、不下锅"（加入盐、烹入黄酒） */
+  const wfSeasonOnly = c => /^(烹入|加入|淋入|调入|倒入|撒入|加|撒|放|淋)/.test(c)
+    && !/锅|烧热|翻炒|炒|煮|炖|焖|煸|煎|炸|蒸|焯/.test(c);
+
+  /* 这句话是在动刀/洗（切配类动作） */
+  const wfIsCut = c => /切|剁|撕|掰|剥|拍|刮|洗净/.test(c) && !/锅|下锅|翻炒/.test(c);
+
+  /* 菜里哪些食材要动刀：有刀工单位的、或做法里点到"切 X"的 */
+  function wfCutList(d) {
+    const t = (d.steps || []).join('；');
+    const NO_CUT = /^(面条|挂面|米|糙米|面粉|鸡蛋|米饭|粉条|年糕|水)/;
+    return (d.ing || []).filter(x => !x.opt && x.cat !== '调料' && x.key !== 'water')
+      .filter(x => !NO_CUT.test(x.name) && !/蛋$/.test(x.name))
+      .filter(x => (x.unit && /根|棵|个|段|瓣|枚|朵|块|片/.test(x.unit)) || (x.g || 0) >= 50 || t.indexOf(x.name) >= 0)
+      .map(x => x.name);
+  }
+
+  /* 这道菜里 X 是怎么切的（切丝/切段/切末），用来标"两菜切法不同" */
+  function wfCutStyle(d, name) {
+    const cs = (d.steps || []).map(s => wfClauses(s)).reduce((a, b) => a.concat(b), []);
+    const hit = cs.find(c => c.indexOf(name) >= 0 && /切|剁/.test(c));
+    if (!hit) return '';
+    const m = hit.match(/切([丝段末片丁块条末米花])/);
+    return m ? '切' + m[1] : '';
+  }
+
+  /* 这句话是在"等着"吗（浸泡 15 分钟、关火焖 5 分钟）：是的话抽出分钟数，做成后台步子 */
+  const wfWait = c => {
+    if (!/浸泡|关火|焖|静置|腌|泡发|醒|冷藏|放凉|炖|小火/.test(c)) return 0;
+    const h = String(c).match(/(\d+(?:\.\d+)?)\s*(?:个)?\s*小时/);
+    if (h) return Math.min(180, Math.round(parseFloat(h[1]) * 60));
+    const m = String(c).match(/(\d+)\s*分钟/);
+    return m ? Math.min(120, +m[1]) : 0;
+  };
+
+  /* 一道菜的工序卡（C 粒度）：切配（一行列清）→ 下锅（按锅次）→ 调味（列出加什么）→ 出锅 */
   function wfCard(d) {
-    const steps = (d.steps || []).slice();
+    const cuts = wfCutList(d);
     const min = Math.max(15, d.min || 25);
     const ops = [];
-    const push = (label, dur) => {
-      const last = ops[ops.length - 1];
-      if (last && last.label === label && last.dur) { last.dur += dur; return; }   // 连续的洗切并成一步
-      ops.push({ label, dur, hands: 1 });
+    if (cuts.length) {
+      ops.push({
+        label: '切配：' + cuts.join('、'), dur: wfClamp(1.5 + cuts.length * 0.6, 2, 6),
+        hands: 1, kind: 'prep', items: cuts
+      });
+    }
+    let pending = [];            // 攒着的调味
+    const TRIVIAL = /^(加入|倒入|淋入)?(食用油|油|热水|温水|清水|水|少量油|一点点油)$/;
+    const flushSeason = () => {
+      if (!pending.length) return;
+      const tr = pending.filter(p => TRIVIAL.test(p.replace(/[（(][^)）]*[)）]/g, '')));
+      const real = pending.filter(p => tr.indexOf(p) < 0);
+      const prev = ops[ops.length - 1];
+      if (tr.length && prev && prev.kind === 'cook') prev.label += '（' + tr.join('、') + '）';
+      pending = [];
+      if (!real.length) return;
+      ops.push({ label: '调味：' + real.join(' → '), dur: wfClamp(real.length * 0.75, 0.75, 2), hands: 1, kind: 'season' });
     };
-    steps.forEach((s, i) => {
-      const txt = String(s || '');
-      const isLast = i === steps.length - 1;
-      if (/锅|火|油|炒|煎|煸|炖|焖|煮|蒸|炸|烧热|下锅|盛出/.test(txt)) {
-        if (/焯/.test(txt) && !/炒|煎|煸/.test(txt)) push('焯水', 3);
-        else push(wfLabel(txt), 4);
-      } else if (/切|剁|撕|掰|剥|拍/.test(txt)) {
-        push('洗切：' + (wfCut(txt) || '配料'), 2);
-      } else if (/调|水淀粉|碗汁|料汁|备用/.test(txt)) {
-        push('调汁：' + (wfShort(txt) || '兑碗汁'), 1.5);
-      } else {
-        push('洗切：' + (wfCut(txt) || '配料'), 2);
+    const all = [];
+    (d.steps || []).forEach(s => wfClauses(s).forEach(c => all.push(c)));
+    all.forEach((c, i) => {
+      if (wfIsCut(c)) return;                       // 切配已经单独成行了
+      const wait = wfWait(c);
+      if (wait) {                                   // 浸泡/焖/腌这类：做成后台步子
+        flushSeason();
+        const wl = String(c).replace(/[（(].*$/, '').replace(/[0-9０-９]+\s*分钟.*$/, '').trim();
+        ops.push({ label: (wfShort(wl) || '等着') + ' · ' + wait + ' 分钟', dur: wait, hands: 0, kind: 'wait' });
+        return;
       }
-      if (isLast && !/装盘|出锅/.test(ops[ops.length - 1].label)) ops[ops.length - 1].label += ' → 出锅';
+      if (wfSeasonOnly(c)) { pending.push(wfShort(c)); return; }
+      flushSeason();
+      const label = wfLabel(c);
+      const last = ops[ops.length - 1];
+      /* 连续的下锅动作并成一步（"盛出"是分界；一步最多攒两句，别糊成一大块） */
+      if (last && last.kind === 'cook' && last.dur < 5 && !/盛出|出锅/.test(last.label)) {
+        last.dur += 2.5; last.label += ' + ' + wfShort(c); return;
+      }
+      ops.push({ label, dur: 2.5, hands: 1, kind: 'cook', fam: label.split('：')[0] });
     });
-    /* 总时长贴近菜谱标的分钟数 */
-    const sum = ops.reduce((a, x) => a + x.dur, 0) || 1;
+    flushSeason();
+    if (!ops.length) ops.push({ label: '备菜', dur: 2, hands: 1, kind: 'prep' });
+    /* 最后一步收尾装盘 */
+    const lastOp = ops[ops.length - 1];
+    if (!/装盘|出锅/.test(lastOp.label)) lastOp.label += ' → 出锅';
+    /* 总时长贴近菜谱标的分钟数（只缩放"动手"的那些，浸泡/焖的真实分钟不动） */
+    const sum = ops.reduce((a, x) => a + (x.hands ? x.dur : 0), 0) || 1;
     const k = wfClamp(min / sum, 0.75, 1.45);
-    ops.forEach(x => { x.dur = Math.max(1.5, Math.round(x.dur * k * 2) / 2); });
+    ops.forEach(x => { if (x.hands) x.dur = Math.max(0.75, Math.round(x.dur * k * 2) / 2); });
     return ops;
+  }
+
+  /* 两道菜都要切的同一样东西：合并成一次，切法不同就写清楚 */
+  function wfMergePrep(cards) {
+    const where = {};            // 食材 -> [{dish, style}]
+    cards.forEach(c => (c.ops || []).forEach(op => {
+      if (op.kind !== 'prep') return;
+      op.items.forEach(n => { (where[n] = where[n] || []).push({ dish: c.name, style: wfCutStyle(c.dish, n) }); });
+    }));
+    const shared = Object.keys(where).filter(n => where[n].length > 1);
+    if (!shared.length) return null;
+    const txt = shared.map(n => {
+      const list = where[n].filter((v, i, a) => a.findIndex(z => z.style === v.style) === i);
+      const styles = list.map(v => v.style ? v.dish + v.style : v.dish).join(' / ');
+      return list.length > 1 || list[0].style ? `${n}（${styles}）` : n;
+    });
+    return { label: '切配（两菜共用）：' + txt.join('、'), dur: wfClamp(1.5 + shared.length * 0.6, 2, 6), hands: 1, kind: 'prep', shared: shared };
   }
   /* 需要提前量的事（泡发木耳这类）单独列出来 */
   function wfPrep(state, meal) {
@@ -1029,17 +1112,41 @@
       const steamMin = st.key === 'brown_rice' ? 30 : 25;
       queues.push({
         name: st.name, ops: [
-          { label: '淘米、' + st.name + '上蒸锅', dur: 2, hands: 1 },
-          { label: '蒸 ' + steamMin + ' 分钟', dur: steamMin, hands: 0 },
-          { label: '关火焖 5 分钟', dur: 5, hands: 0 }
+          { label: '淘米、' + st.name + '上蒸锅', dur: 2, hands: 1, kind: 'rice' },
+          { label: '蒸 ' + steamMin + ' 分钟', dur: steamMin, hands: 0, kind: 'rice' },
+          { label: '关火焖 5 分钟', dur: 5, hands: 0, kind: 'rice' }
         ]
       });
     }
-    (meal.dishes || []).forEach(id => { const d = DISH[id]; if (d) queues.push({ name: d.name, ops: wfCard(d) }); });
+    /* 每道菜的工序卡 */
+    const cards = [];
+    (meal.dishes || []).forEach(id => {
+      const d = DISH[id]; if (!d) return;
+      const ops = wfCard(d);
+      /* 易损菜（爆炒、凉拌、炸）排后面做：等一会儿就不好吃了 */
+      const txt = (d.steps || []).join(' ');
+      const fragile = /爆炒|大火快炒|凉拌|炸|酥|拌面/.test(txt) || (/炒/.test(txt) && (d.min || 30) <= 25);
+      cards.push({ name: d.name, dish: d, ops, fragile });
+    });
+    /* 两菜都要切的东西合并成一次（切法不同会标出来） */
+    const shared = wfMergePrep(cards);
+    if (shared) {
+      cards.forEach(c => {
+        c.ops = c.ops.filter(op => {
+          if (op.kind !== 'prep' || !op.items) return true;
+          op.items = op.items.filter(n => shared.shared.indexOf(n) < 0);
+          if (!op.items.length) return false;
+          op.label = '切配：' + op.items.join('、');
+          return true;
+        });
+      });
+      queues.push({ name: '两菜共用', ops: [shared] });
+    }
+    cards.forEach(c => queues.push({ name: c.name, ops: c.ops, fragile: c.fragile }));
     if (!queues.length) return { steps: [], total: 0, prep: [] };
     const idx = queues.map(() => 0);
     const steps = [];
-    let t = 0, guard = 0;
+    let t = 0, guard = 0, lastQi = -1;
     while (guard++ < 600) {
       let best = null, minEnd = Infinity, left = 0;
       queues.forEach((q, qi) => {
@@ -1048,13 +1155,24 @@
         const prevEnd = idx[qi] ? q.ops[idx[qi] - 1].end : 0;
         if (prevEnd > t) { minEnd = Math.min(minEnd, prevEnd); return; }
         const rem = q.ops.slice(idx[qi]).reduce((a, x) => a + x.dur, 0);
-        if (!best || rem > best.rem) best = { qi, rem };
+        const kd = q.ops[idx[qi]].kind;
+        /* 易损菜只在别的菜快做完时才动锅（切配可以提前做） */
+        if (q.fragile && kd !== 'prep') {
+          const othersLeft = queues.reduce((a, o, oi) => (oi === qi || idx[oi] >= o.ops.length) ? a
+            : a + o.ops.slice(idx[oi]).filter(x => x.hands).reduce((s, x) => s + x.dur, 0), 0);
+          if (othersLeft > 12) return;
+        }
+        const pri = kd === 'rice' ? 3 : (kd === 'prep' && !q.fragile) ? 2 : 0;   // 米饭最先、切配其次（易损菜不提前占手）
+        let score = rem * (q.fragile ? 0.55 : 1);                // 易损菜往后排
+        /* 粘性：刚动过手的那道菜，下一步继续做（别一分钟换一次锅） */
+        if (qi === lastQi && q.ops[idx[qi]].hands) score *= 1.35;
+        if (!best || pri > best.pri || (pri === best.pri && score > best.score)) best = { qi, rem, pri, score };
       });
       if (!left) break;
       if (!best) { if (!isFinite(minEnd)) break; t = minEnd; continue; }
       const q = queues[best.qi], op = q.ops[idx[best.qi]];
       op.start = t; op.end = t + op.dur; op.dish = q.name;
-      if (op.hands) t = op.end;
+      if (op.hands) { t = op.end; lastQi = best.qi; }
       idx[best.qi]++;
       steps.push(op);
     }
@@ -1065,7 +1183,7 @@
 
   root.Core = {
     DAY, WEEK_CN, DISH, ING, SUGGEST, dt, iso, addD, dow, dspan, md, weekDays, mondayOf, money, yuan,
-    wfCard, wfPlan, wfPrep,
+    wfCard, wfPlan, wfPrep, wfMergePrep, wfCutList,
     mainProtein, shelfOf, hasLeafy, dishCost, batchesOf, batchIndexOf, generate, shopping, skuOf, keepDays,
     invQty, fillers, copyText, usedRecently, constraints, STAPLE, stapleOf, mealKcal, stapleKind, stapleWeek,
     priceFactor, hydrateCustom, todayStr, invDays, addInv, consumeInv, mealNeeds, fridgeScore, mealInStock,

@@ -691,14 +691,34 @@
   }
 
   /* ---------------- 抽屉 ---------------- */
+  /* 抽屉打开时压一条浏览历史：安卓侧滑/返回键先关抽屉，而不是直接退出应用 */
+  let histDepth = 0, histClosing = false;
+  function pushHist() {
+    if (histDepth > 8) return;
+    try { history.pushState({ sh: histDepth + 1 }, ''); histDepth++; } catch (e) {}
+  }
+  function popHist() {
+    if (!histDepth) return;
+    histClosing = true;
+    try { history.back(); } catch (e) { histClosing = false; histDepth = 0; }
+  }
+  try {
+    window.addEventListener('popstate', () => {
+      if (histClosing) { histClosing = false; histDepth = Math.max(0, histDepth - 1); return; }
+      if (histDepth > 0) { histDepth--; hideSheet(true); }
+    });
+  } catch (e) {}
+
   function showSheet(html) {
     const sh = $('#sheet'); sh.innerHTML = `<div class="grab"></div>${html}`;
     $('#backdrop').classList.add('on'); sh.classList.add('on'); sh.scrollTop = 0;
+    pushHist();
   }
-  function hideSheet() {
+  function hideSheet(fromPop) {
     $('#sheet').classList.remove('on'); $('#backdrop').classList.remove('on');
+    if (!fromPop) popHist();          // 点关闭：把刚才压的那条历史退掉
   }
-  $('#backdrop').onclick = hideSheet;
+  $('#backdrop').onclick = () => hideSheet();
 
   /* 开工：把两三道菜的工序排成一条时间轴，边做边看 */
   function sheetFlow(date) {
